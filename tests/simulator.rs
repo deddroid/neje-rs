@@ -170,3 +170,12 @@ fn pause_gets_through_without_a_handshake_reply() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("Warning"));
 }
+
+#[test]
+fn listening_sends_nothing() {
+    let sim = simulator(Version::V10, 100);
+    let engraver = Engraver::listen(sim.port(), neje::protocol::Protocol::new(Version::V10, None)).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!engraver.acknowledged());
+    assert!(sim.report().received.is_empty(), "a passive session must not write to the port");
+}

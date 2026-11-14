@@ -227,11 +227,13 @@ enum Cmd {
     PowerOn,
     /// Power off (V2x/V30)
     PowerOff,
-    /// Move the head
+    /// Move the head (this also moves where the image will be engraved)
     Move {
         #[arg(value_enum)]
         direction: DirectionArg,
-        #[arg(default_value_t = 1)]
+        /// Number of steps, at most 20 per call: the machine has no limit switches and
+        /// keeps pushing against the end stop
+        #[arg(default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=20))]
         steps: u32,
         /// Seconds between steps
         #[arg(long, default_value_t = 0.1)]
@@ -243,7 +245,11 @@ enum Cmd {
         value: u8,
     },
     /// Show the messages from the engraver
-    Monitor,
+    Monitor {
+        /// Only listen: do not send the handshake (needs --port)
+        #[arg(long)]
+        passive: bool,
+    },
     /// Run a virtual engraver for tests (Unix)
     Simulate {
         #[arg(long, value_enum, default_value = "v10")]
@@ -454,8 +460,15 @@ fn preview(app: &App, image: &ImageArgs, output: &PathBuf, payload: Option<&Path
     Ok(())
 }
 
-fn monitor(app: &App) -> Result<()> {
-    let engraver = app.connect()?;
+fn monitor(app: &App, passive: bool) -> Result<()> {
+    let engraver = if passive {
+        let Some(port) = &app.port else {
+            bail!(tr("--passive needs --port", "--passive richiede --port"));
+        };
+        Engraver::listen(port, app.offline_protocol())?
+    } else {
+        app.connect()?
+    };
     println!("{}", tr("Listening (Ctrl+C to quit)...", "In ascolto (Ctrl+C per uscire)..."));
     engraver.wait_for(
         |event| *event == Event::Disconnected,
@@ -579,7 +592,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::SetBurn { value } => app.simple(Command::SetBurn(value)),
-        Cmd::Monitor => monitor(&app),
+        Cmd::Monitor { passive } => monitor(&app, passive),
         Cmd::Simulate { sim_protocol, output } => simulate(&app, sim_protocol, output),
         Cmd::Gui => gui(&app),
     }

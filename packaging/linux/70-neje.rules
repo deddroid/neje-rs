@@ -1,0 +1,9 @@
+# NEJE DK-8-KZ laser engraver: its USB-serial converter is a WCH CH340/CH341 (kernel driver
+# "ch341"). This rule lets the user logged in at the computer open the port, without root
+# and without joining a group. Other devices built on the same converter get the same access.
+# The file name must sort before 73-seat-late.rules for "uaccess" to work.
+# Install: sudo cp 70-neje.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="5523", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7522", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="4348", ATTRS{idProduct}=="5523", TAG+="uaccess"

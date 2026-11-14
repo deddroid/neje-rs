@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=NEJE Engraver
+Name[it]=Incisore NEJE
+GenericName=Laser engraver
+GenericName[it]=Incisore laser
+Comment=Prepare pictures, text and G-code and engrave them with a NEJE DK-8-KZ
+Comment[it]=Prepara immagini, testo e G-code e incidili con un NEJE DK-8-KZ
+Exec=neje-gui %f
+Icon=neje
+Terminal=false
+Categories=Graphics;Utility;
+Keywords=laser;engraver;neje;dk-8-kz;gcode;
+Keywords[it]=laser;incisore;neje;dk-8-kz;gcode;
+StartupWMClass=neje

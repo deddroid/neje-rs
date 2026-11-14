@@ -28,7 +28,7 @@ const UPLOAD_CHUNK: usize = 1024;
 pub const AFTER_UPLOAD_PAUSE: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 /// How long each handshake waits for its reply during detection.
-const PROBE_WAIT: Duration = Duration::from_millis(150);
+const PROBE_WAIT: Duration = Duration::from_millis(500);
 /// How long a new session waits for the reply to its handshake.
 const CONNECT_WAIT: Duration = Duration::from_secs(1);
 
@@ -268,6 +268,16 @@ impl Engraver {
     /// [`Engraver::acknowledged`] tells whether the engraver answered. Useful when the
     /// firmware may be too busy to answer, e.g. to pause a running engraving.
     pub fn open(port: &str, protocol: Protocol) -> Result<Self, DeviceError> {
+        let mut engraver = Self::listen(port, protocol)?;
+        // Repeat the handshake on the open session, like FormOld/FormMain.
+        engraver.write(protocol.handshake())?;
+        engraver.acknowledged = engraver.shared.wait_for(CONNECT_WAIT, |s| s.connected);
+        Ok(engraver)
+    }
+
+    /// Opens a session on `port` without sending anything, not even the handshake: to watch
+    /// what the engraver says on its own.
+    pub fn listen(port: &str, protocol: Protocol) -> Result<Self, DeviceError> {
         let writer = open(port)?;
         let reader_port = writer.try_clone().map_err(|source| DeviceError::Open { port: port.to_owned(), source })?;
         let shared = Arc::new(Shared {
@@ -280,18 +290,14 @@ impl Engraver {
             let shared = Arc::clone(&shared);
             move || read_loop(reader_port, Parser::new(protocol), &shared, &tx)
         });
-        let mut engraver = Engraver {
+        Ok(Engraver {
             port: port.to_owned(),
             writer: Mutex::new(writer),
             events,
             shared,
             acknowledged: false,
             reader: Some(reader),
-        };
-        // Repeat the handshake on the open session, like FormOld/FormMain.
-        engraver.write(protocol.handshake())?;
-        engraver.acknowledged = engraver.shared.wait_for(CONNECT_WAIT, |s| s.connected);
-        Ok(engraver)
+        })
     }
 
     pub fn port(&self) -> &str {
