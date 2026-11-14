@@ -14,6 +14,7 @@ use neje::compose::{Job, TextLayer};
 use neje::device::{self, Engraver};
 use neje::i18n::{self, Lang, tr};
 use neje::imaging::{self, Mode};
+use neje::messages::{describe, laser_checklist};
 use neje::protocol::{BURN_DEFAULT, BURN_MAX, BURN_MIN, Command, Direction, Event, Protocol, Version};
 
 #[derive(Parser)]
@@ -393,10 +394,13 @@ fn confirm_laser(yes: bool) -> Result<()> {
     println!(
         "{}",
         tr(
-            "This command SWITCHES THE LASER ON AT FULL POWER. Before continuing:\n  - wear the protective goggles;\n  - put the material under the head;\n  - keep anything flammable away.",
-            "Questo comando ACCENDE IL LASER A PIENA POTENZA. Prima di continuare:\n  - indossa gli occhiali protettivi;\n  - metti il materiale sotto la testa;\n  - allontana tutto ciò che è infiammabile.",
+            "This command SWITCHES THE LASER ON AT FULL POWER. Before continuing:",
+            "Questo comando ACCENDE IL LASER A PIENA POTENZA. Prima di continuare:"
         )
     );
+    for item in laser_checklist() {
+        println!("  - {item};");
+    }
     print!("{} ", tr("Type \"yes\" to continue:", "Scrivi \"si\" per continuare:"));
     io::stdout().flush()?;
     let mut answer = String::new();
@@ -404,32 +408,6 @@ fn confirm_laser(yes: bool) -> Result<()> {
     match answer.trim().to_lowercase().as_str() {
         "yes" | "y" | "si" | "sì" | "s" => Ok(()),
         _ => bail!(tr("cancelled", "annullato")),
-    }
-}
-
-fn describe(event: &Event) -> String {
-    match *event {
-        Event::Connected { hw: Some(hw) } => {
-            format!("{} (hardware {hw})", tr("Connected", "Connesso"))
-        }
-        Event::Connected { hw: None } => tr("Connected", "Connesso").to_owned(),
-        Event::Progress { x, y } => format!("X:{x} Y:{y}"),
-        Event::Finished => tr("Engraving finished", "Incisione terminata").to_owned(),
-        Event::NoPower => {
-            tr("No power: plug in the 5 V power supply", "Alimentazione assente: collega l'alimentatore 5 V").to_owned()
-        }
-        Event::PowerOk => tr("Power supply present", "Alimentazione presente").to_owned(),
-        Event::EraseDone => tr("Memory erased", "Memoria cancellata").to_owned(),
-        Event::TransferImage => tr("Ready to receive the image", "Pronto a ricevere l'immagine").to_owned(),
-        Event::Version(v) => format!("{}: {v}", tr("Hardware version", "Versione hardware")),
-        Event::LowBatterySleep => tr("Sleeping: battery low", "In sospensione: batteria scarica").to_owned(),
-        Event::TimeoutSleep => tr("Sleeping: idle for too long", "In sospensione: inattivo da troppo tempo").to_owned(),
-        Event::Debug(v) => format!("Debug: {v}"),
-        Event::Battery(v) => format!("{}: {v}", tr("Battery", "Batteria")),
-        Event::BurnValue(v) => format!("{}: {v}", tr("Burn time on the machine", "Tempo di bruciatura sulla macchina")),
-        Event::VerifyOk => tr("Verification OK", "Verifica OK").to_owned(),
-        Event::Unknown(b) => format!("{}: {b:#04x}", tr("Unknown byte", "Byte sconosciuto")),
-        Event::Disconnected => tr("Connection lost", "Connessione persa").to_owned(),
     }
 }
 

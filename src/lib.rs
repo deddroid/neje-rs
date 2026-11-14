@@ -17,6 +17,7 @@ mod draw;
 pub mod gcode;
 pub mod i18n;
 pub mod imaging;
+pub mod messages;
 pub mod protocol;
 mod resample;
 #[cfg(unix)]
