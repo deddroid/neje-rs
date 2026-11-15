@@ -17,7 +17,7 @@ terminale.
 | Comandi e messaggi dei protocolli V10, V20, V21, V30 | stessi byte dell'implementazione di riferimento |
 | Rilevamento, cancellazione, invio, avvio, avanzamento, fine lavoro | provati con l'incisore virtuale incluso |
 | Modalità di stampa (divisione in lavori, a tratto) e stime dei tempi | stessi tagli e stessi tempi dello strumento di riferimento; la divisione è stata provata su una macchina vera con quello strumento (stimati 143 s, impiegati 148 s, le parti combaciano) |
-| Una DK-8-KZ vera (firmware V10) | `detect`, `reset`, `upload`, `box`, `center` ed `engrave` in modalità a tratto (tre lavori di fila, 133 s contro 129 stimati) hanno funzionato su una macchina. Non ancora provati lì: la finestra, `pause`, `forward`/`backward`/`redo`, `move`, `monitor` e una divisione con il taglio dentro una forma piena (vedi [docs/PROTOCOL.md](docs/PROTOCOL.md)) |
+| Una DK-8-KZ vera (firmware V10) | `detect`, `reset`, `upload`, `start`, `box`, `center` ed `engrave` hanno funzionato su una macchina, in modalità a tratto (tre lavori di fila, 133 s contro 129 stimati) e in modalità divisa con un taglio dentro una forma piena (441 s contro 439 stimati). Non ancora provati lì: la finestra, `pause`, `forward`/`backward`/`redo`, `move`, `monitor` (vedi [docs/PROTOCOL.md](docs/PROTOCOL.md)) |
 | Windows | compilato e provato dalla CI (senza porta seriale); mai provato con un incisore |
 
 La DK-8-KZ incide 490 × 490 pixel. Il manuale dice 0,075 mm per pixel (36,75 mm); sulla

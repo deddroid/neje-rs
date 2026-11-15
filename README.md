@@ -16,7 +16,7 @@ G-code drawing, send it to the engraver and run the job, from a window or from t
 | Commands and messages of protocols V10, V20, V21, V30 | same bytes as the reference implementation |
 | Detection, erase, upload, start, progress, end of job | tested against the built-in virtual engraver |
 | Print modes (split in jobs, line art) and time estimates | same cuts and times as the reference tool; the split was checked on a real machine with that tool (estimated 143 s, took 148 s, the parts lined up) |
-| A real DK-8-KZ (V10 firmware) | `detect`, `reset`, `upload`, `box`, `center` and `engrave` in line-art mode (three jobs in a row, 133 s against 129 estimated) worked on one machine. Not tried there yet: the window, `pause`, `forward`/`backward`/`redo`, `move`, `monitor`, and a split whose cut crosses a filled shape (see [docs/PROTOCOL.md](docs/PROTOCOL.md)) |
+| A real DK-8-KZ (V10 firmware) | `detect`, `reset`, `upload`, `start`, `box`, `center` and `engrave` worked on one machine, in line-art mode (three jobs in a row, 133 s against 129 estimated) and in split mode with a cut across a filled shape (441 s against 439 estimated). Not tried there yet: the window, `pause`, `forward`/`backward`/`redo`, `move`, `monitor` (see [docs/PROTOCOL.md](docs/PROTOCOL.md)) |
 | Windows | built and tested by the CI (no serial port there); never tried with an engraver |
 
 The DK-8-KZ engraves 490 × 490 pixels. The manual says 0.075 mm per pixel (36.75 mm); on the
