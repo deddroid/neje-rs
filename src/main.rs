@@ -14,7 +14,8 @@ use neje::compose::{Job, TextLayer};
 use neje::device::{self, Engraver};
 use neje::i18n::{self, Lang, tr};
 use neje::imaging::{self, Mode};
-use neje::messages::{describe, laser_checklist};
+use neje::messages::{describe, laser_checklist, mode_description, mode_name};
+use neje::plan::{self, Plan, PrintMode};
 use neje::protocol::{BURN_DEFAULT, BURN_MAX, BURN_MIN, Command, Direction, Event, Protocol, Version};
 
 #[derive(Parser)]
@@ -74,6 +75,16 @@ enum ModeArg {
     GrayThreshold,
 }
 
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum PrintModeArg {
+    /// One upload, one start
+    Single,
+    /// Vertical bands engraved one after the other, to skip the empty space between distant parts
+    Split,
+    /// Centre lines with a stroke of a few pixels instead of filled shapes
+    Line,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum DirectionArg {
     Up,
@@ -122,9 +133,23 @@ struct ImageArgs {
     /// G-code: line thickness in pixels
     #[arg(long, default_value_t = 1)]
     line: u32,
+    /// How the image is sent to the engraver ("neje preview" compares the modes)
+    #[arg(long, value_enum, default_value = "single")]
+    print_mode: PrintModeArg,
+    /// Line mode: stroke width in pixels
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=i64::from(plan::MAX_STROKE)))]
+    stroke: u8,
 }
 
 impl ImageArgs {
+    fn print_mode(&self) -> PrintMode {
+        match self.print_mode {
+            PrintModeArg::Single => PrintMode::Single,
+            PrintModeArg::Split => PrintMode::Split,
+            PrintModeArg::Line => PrintMode::Line { stroke: self.stroke },
+        }
+    }
+
     fn job(&self) -> Job {
         Job {
             image: self.image.clone(),
@@ -191,13 +216,24 @@ enum Cmd {
         image: ImageArgs,
         #[arg(short, long, default_value = "preview.png")]
         output: PathBuf,
-        /// Also save the exact bytes that would be sent
+        /// Also save the exact bytes that would be sent (first job)
         #[arg(long)]
         payload: Option<PathBuf>,
+        /// Burn time used for the time estimates, 1-120
+        #[arg(short, long, default_value_t = BURN_DEFAULT, value_parser = clap::value_parser!(u8).range(i64::from(BURN_MIN)..=i64::from(BURN_MAX)))]
+        burn: u8,
+        /// Save a picture of the plan: black = burnt, orange = empty space crossed,
+        /// green = empty space no longer crossed, blue = cut between two jobs
+        #[arg(long)]
+        plan_image: Option<PathBuf>,
+        /// Save the image of every job as PREFIX-1.png, PREFIX-2.png, ...
+        #[arg(long, value_name = "PREFIX")]
+        jobs: Option<String>,
     },
     /// Send the image to the engraver
     Upload(UploadArgs),
-    /// Send the image and start engraving. SWITCHES THE LASER ON
+    /// Send the image and start engraving, one job after the other when the print mode
+    /// splits it. SWITCHES THE LASER ON
     Engrave {
         #[command(flatten)]
         upload: UploadArgs,
@@ -328,14 +364,17 @@ impl App {
         self.simple(command)
     }
 
-    fn upload(&self, engraver: &Engraver, args: &UploadArgs) -> Result<()> {
-        let image = args.image.job().build(engraver.protocol().base_size())?;
-        if let Some(path) = &args.save_preview {
-            image.save(path).with_context(|| format!("cannot save {}", path.display()))?;
-        }
+    /// The image described by `args`, prepared for its print mode.
+    fn plan(&self, args: &ImageArgs, protocol: Protocol, burn: u8) -> Result<Plan> {
+        let base = args.job().build(protocol.base_size())?;
+        Ok(Plan::new(&base, args.print_mode(), burn, protocol))
+    }
+
+    /// Erases the memory of the engraver and sends `image`.
+    fn send_image(&self, engraver: &Engraver, image: &image::GrayImage, args: &UploadArgs) -> Result<()> {
         println!("{}", tr("Erasing the memory...", "Cancellazione della memoria..."));
         let wait = args.erase_wait.map(Duration::try_from_secs_f64).transpose().context("invalid --erase-wait")?;
-        engraver.upload(&image, wait, |sent, total| {
+        engraver.upload(image, wait, |sent, total| {
             print!("\r  {:3}%  ({sent}/{total} byte)", sent * 100 / total);
             // Progress output only: a failed flush is not worth stopping the upload.
             let _ = io::stdout().flush();
@@ -344,18 +383,81 @@ impl App {
         Ok(())
     }
 
-    fn run(&self, engraver: &Engraver, args: &RunArgs) -> Result<()> {
+    fn upload(&self, engraver: &Engraver, args: &UploadArgs) -> Result<()> {
+        let plan = self.plan(&args.image, engraver.protocol(), BURN_DEFAULT)?;
+        if plan.jobs.len() > 1 {
+            bail!(
+                "{} {} {}",
+                tr("this print mode splits the image in", "questa modalità divide l'immagine in"),
+                plan.jobs.len(),
+                tr(
+                    "jobs, and the engraver holds one image at a time: use \"neje engrave\"",
+                    "lavori, e l'incisore tiene una sola immagine alla volta: usa \"neje engrave\"",
+                )
+            );
+        }
+        if let Some(path) = &args.save_preview {
+            plan.image.save(path).with_context(|| format!("cannot save {}", path.display()))?;
+        }
+        self.send_image(engraver, &plan.jobs[0].image, args)
+    }
+
+    /// Sends and engraves every job of the plan, one after the other.
+    fn engrave(&self, engraver: &Engraver, upload: &UploadArgs, run: &RunArgs) -> Result<()> {
+        let plan = self.plan(&upload.image, engraver.protocol(), run.burn)?;
+        if plan.is_empty() {
+            bail!(tr("the image is empty: nothing to burn", "l'immagine è vuota: niente da bruciare"));
+        }
+        if let Some(path) = &upload.save_preview {
+            plan.image.save(path).with_context(|| format!("cannot save {}", path.display()))?;
+        }
+        println!(
+            "{}: {}, {} {}",
+            mode_name(plan.mode),
+            jobs_text(plan.jobs.len()),
+            tr("estimated time", "tempo stimato"),
+            plan::clock(plan.seconds)
+        );
+        for (i, job) in plan.jobs.iter().enumerate() {
+            if plan.jobs.len() > 1 {
+                println!(
+                    "{} {}/{}: {} {}-{}, {} {}",
+                    tr("Job", "Lavoro"),
+                    i + 1,
+                    plan.jobs.len(),
+                    tr("columns", "colonne"),
+                    job.columns.start,
+                    job.columns.end - 1,
+                    tr("estimated time", "tempo stimato"),
+                    plan::clock(job.seconds)
+                );
+            }
+            self.send_image(engraver, &job.image, upload)?;
+            thread::sleep(device::AFTER_UPLOAD_PAUSE);
+            // The engraver must not be restarted between two jobs, or they no longer line up.
+            if !self.run(engraver, run)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the engraving and waits for its end; false when it did not finish (Ctrl+C,
+    /// time limit, connection lost).
+    fn run(&self, engraver: &Engraver, args: &RunArgs) -> Result<bool> {
         println!(
             "{} {}",
             tr("Starting the engraving, burn time", "Avvio dell'incisione, tempo di bruciatura"),
             args.burn
         );
+        // Forget the messages that arrived before the start (handshake replies).
+        engraver.events().try_iter().for_each(drop);
         engraver.start(args.burn)?;
         let started = Instant::now();
         let mut last_shown = Instant::now() - Duration::from_secs(2);
         let timeout = args.timeout.map(Duration::try_from_secs_f64).transpose().context("invalid --timeout")?;
         let end = engraver.wait_for(
-            |event| matches!(event, Event::Finished | Event::Disconnected),
+            |event| matches!(event, Event::Finished | Event::Disconnected | Event::PowerOk),
             timeout,
             |event| match *event {
                 Event::Progress { x, y } => {
@@ -376,14 +478,29 @@ impl App {
         if self.interrupted() {
             println!("\n{}", tr("Interrupted: pausing the engraver", "Interrotto: metto in pausa l'incisore"));
             engraver.send(Command::Pause)?;
-        } else if end.is_none() {
-            println!(
-                "\n{}",
-                tr("No end message within the time limit", "Nessun messaggio di fine entro il tempo massimo")
-            );
+            return Ok(false);
         }
-        Ok(())
+        match end {
+            Some(Event::Finished) => Ok(true),
+            // The board answers 79 when it restarts: the end message will never come.
+            Some(Event::PowerOk) => bail!(tr(
+                "the engraver restarted during the job, which is incomplete. Power it from a 5 V supply, not from the USB ports of the computer",
+                "l'incisore si è riavviato durante il lavoro, che è incompleto. Alimentalo con un alimentatore 5 V, non dalle porte USB del computer",
+            )),
+            Some(_) => Ok(false),
+            None => {
+                println!(
+                    "\n{}",
+                    tr("No end message within the time limit", "Nessun messaggio di fine entro il tempo massimo")
+                );
+                Ok(false)
+            }
+        }
     }
+}
+
+fn jobs_text(n: usize) -> String {
+    if n == 1 { tr("1 job", "1 lavoro").to_owned() } else { format!("{n} {}", tr("jobs", "lavori")) }
 }
 
 /// Asks the operator to confirm the laser safety conditions, unless `--yes` was given.
@@ -431,23 +548,79 @@ fn ports() -> Result<()> {
     Ok(())
 }
 
-fn preview(app: &App, image: &ImageArgs, output: &PathBuf, payload: Option<&PathBuf>) -> Result<()> {
+struct PreviewOutputs<'a> {
+    output: &'a PathBuf,
+    payload: Option<&'a PathBuf>,
+    plan_image: Option<&'a PathBuf>,
+    jobs: Option<&'a str>,
+}
+
+fn preview(app: &App, image: &ImageArgs, burn: u8, out: &PreviewOutputs) -> Result<()> {
     let protocol = app.offline_protocol();
-    let img = image.job().build(protocol.base_size())?;
-    img.save(output).with_context(|| format!("cannot save {}", output.display()))?;
+    let base = image.job().build(protocol.base_size())?;
+    let chosen = Plan::new(&base, image.print_mode(), burn, protocol);
+    let save = |img: &image::GrayImage, path: &std::path::Path| {
+        img.save(path).with_context(|| format!("cannot save {}", path.display()))
+    };
+    save(&chosen.image, out.output)?;
     println!(
-        "{} {} ({}x{}, {:.1}% {}, {} {:.2} mm)",
+        "{} {} ({}x{}, {:.1}% {})",
         tr("Preview saved in", "Anteprima salvata in"),
-        output.display(),
-        img.width(),
-        img.height(),
-        imaging::black_ratio(&img) * 100.0,
+        out.output.display(),
+        chosen.image.width(),
+        chosen.image.height(),
+        imaging::black_ratio(&chosen.image) * 100.0,
         tr("of the pixels to burn", "di pixel da bruciare"),
-        tr("side", "lato"),
-        f64::from(img.width()) * neje::gcode::MM_PER_PX,
     );
-    if let Some(path) = payload {
-        std::fs::write(path, protocol.build_payload(&img))
+
+    // The three modes side by side, so the choice can be made on numbers.
+    println!("\n{} {burn}:", tr("Estimated times at burn time", "Tempi stimati con tempo di bruciatura"));
+    let stroke = if let PrintMode::Line { stroke } = chosen.mode { stroke } else { 1 };
+    for mode in [PrintMode::Single, PrintMode::Split, PrintMode::Line { stroke }] {
+        let plan = if mode == chosen.mode { chosen.clone() } else { Plan::new(&base, mode, burn, protocol) };
+        let cost = plan.cost();
+        let saved = plan.saved_seconds();
+        let gain = if saved.abs() < 0.5 || plan.single_seconds <= 0.0 {
+            String::new()
+        } else {
+            format!("  ({:+.0}%)", -100.0 * saved / plan.single_seconds)
+        };
+        println!(
+            "{} {:<22} {:>9}  {:>7} px {}  {:>7} px {}  {:>6}{gain}",
+            if mode == chosen.mode { "*" } else { " " },
+            mode_name(mode),
+            jobs_text(plan.jobs.len()),
+            cost.burnt,
+            tr("burnt", "bruciati"),
+            cost.crossed,
+            tr("crossed", "attraversati"),
+            plan::clock(plan.seconds),
+        );
+    }
+    println!("\n{}", mode_description(chosen.mode));
+
+    if let Some(path) = out.plan_image {
+        chosen.preview().save(path).with_context(|| format!("cannot save {}", path.display()))?;
+        println!("{} {}", tr("Picture of the plan saved in", "Disegno del piano salvato in"), path.display());
+    }
+    if let Some(prefix) = out.jobs {
+        for (i, job) in chosen.jobs.iter().enumerate() {
+            let path = PathBuf::from(format!("{prefix}-{}.png", i + 1));
+            save(&job.image, &path)?;
+            println!(
+                "{} {}: {} ({} {}-{}, {})",
+                tr("Job", "Lavoro"),
+                i + 1,
+                path.display(),
+                tr("columns", "colonne"),
+                job.columns.start,
+                job.columns.end.saturating_sub(1),
+                plan::clock(job.seconds)
+            );
+        }
+    }
+    if let Some(path) = out.payload {
+        std::fs::write(path, protocol.build_payload(&chosen.jobs[0].image))
             .with_context(|| format!("cannot save {}", path.display()))?;
         println!(
             "{} ({}) {} {}",
@@ -486,7 +659,14 @@ fn simulate(app: &App, sim_protocol: SimProtocol, output: PathBuf) -> Result<()>
         SimProtocol::V10 => Version::V10,
         SimProtocol::V30 => Version::V30,
     };
-    let options = Options { version, hw: app.hw.unwrap_or(11), out_png: Some(output), ..Options::default() };
+    let options = Options {
+        version,
+        hw: app.hw.unwrap_or(11),
+        out_png: Some(output),
+        // Slow enough to watch the trace, far faster than the real machine.
+        pixel_delay: Duration::from_micros(300),
+        ..Options::default()
+    };
     let sim = Simulator::start(options).context("cannot create the pseudo-terminal")?;
     println!("{} {version}: {}", tr("Virtual engraver", "Incisore virtuale"), sim.port());
     println!("{}  neje --port {} engrave photo.jpg", tr("Try:", "Prova:"), sim.port());
@@ -546,7 +726,15 @@ fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Preview { image, output, payload } => preview(&app, &image, &output, payload.as_ref()),
+        Cmd::Preview { image, output, payload, burn, plan_image, jobs } => {
+            let outputs = PreviewOutputs {
+                output: &output,
+                payload: payload.as_ref(),
+                plan_image: plan_image.as_ref(),
+                jobs: jobs.as_deref(),
+            };
+            preview(&app, &image, burn, &outputs)
+        }
         Cmd::Upload(args) => app.upload(&app.connect()?, &args),
         Cmd::Engrave { upload, run } => {
             if upload.image.job().is_empty() {
@@ -557,13 +745,11 @@ fn run(cli: Cli) -> Result<()> {
             }
             confirm_laser(run.laser.yes)?;
             let engraver = app.connect()?;
-            app.upload(&engraver, &upload)?;
-            thread::sleep(device::AFTER_UPLOAD_PAUSE);
-            app.run(&engraver, &run)
+            app.engrave(&engraver, &upload, &run)
         }
         Cmd::Start(args) => {
             confirm_laser(args.laser.yes)?;
-            app.run(&app.connect()?, &args)
+            app.run(&app.connect()?, &args).map(drop)
         }
         Cmd::Pause => app.simple(Command::Pause),
         Cmd::Reset => app.simple(Command::Reset),

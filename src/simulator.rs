@@ -1,8 +1,9 @@
 //! Virtual engraver on a pseudo-terminal, to try the software without the machine.
 //!
-//! It behaves as the V10 or V30 firmware is expected to: answers the handshake, discards
-//! what arrives while it erases, decodes the received image ("virtual engraving"),
-//! reports a few positions and the end of the job. It never does more than the real
+//! It behaves like the V10 firmware measured on a DK-8-KZ (or as the V30 one is expected
+//! to): answers the handshake, discards what arrives while it erases, decodes the received
+//! image ("virtual engraving"), reports the position of every burnt pixel, row by row in a
+//! zig-zag, and the end of the job. It never does more than the real
 //! protocol allows, so mistakes such as sending the image too early show up in
 //! [`Report::errors`].
 
@@ -19,9 +20,6 @@ use serialport::{SerialPort, TTYPort};
 use crate::bitmap::{self, BMP_HEADER_LEN};
 use crate::protocol::{Protocol, V10_PAYLOAD_LEN, Version};
 
-/// Distance in pixels between the positions reported while "engraving".
-const PROGRESS_STEP: usize = 7;
-
 #[derive(Clone, Debug)]
 pub struct Options {
     /// `V10`, or any other version for the 4-byte protocol (answers as V30).
@@ -32,8 +30,11 @@ pub struct Options {
     pub erase_time: Duration,
     /// Where to save the received image.
     pub out_png: Option<PathBuf>,
-    /// Maximum number of positions reported per engraving.
-    pub max_points: usize,
+    /// Pause after each burnt pixel (zero: as fast as possible).
+    pub pixel_delay: Duration,
+    /// Restart the board after this many burnt pixels, as a weak power supply does: it
+    /// sends `79` and the job never ends.
+    pub restart_after: Option<usize>,
 }
 
 impl Default for Options {
@@ -43,7 +44,8 @@ impl Default for Options {
             hw: 11,
             erase_time: Duration::from_millis(1500),
             out_png: None,
-            max_points: 4000,
+            pixel_delay: Duration::ZERO,
+            restart_after: None,
         }
     }
 }
@@ -57,6 +59,8 @@ pub struct Report {
     pub burn: Option<u8>,
     /// Last image received, decoded (0 = burn).
     pub image: Option<GrayImage>,
+    /// The image in memory at each start, in order.
+    pub jobs: Vec<GrayImage>,
     /// Protocol violations, in plain words.
     pub errors: Vec<String>,
     /// Movement and control commands, as hex strings.
@@ -209,7 +213,7 @@ impl Machine {
             match c {
                 0xF6 => {
                     self.record(1, false);
-                    reply(&mut self.master, &[0x65, 0x79]); // connected + power supply present
+                    reply(&mut self.master, &[0x65, 0x70]); // what a real DK-8-KZ answers
                 }
                 0xFE => {
                     if self.buf.len() < 8 {
@@ -244,6 +248,9 @@ impl Machine {
                 }
                 0xF2 | 0xF3 | 0xF4 | 0xF9 | 0xFB => {
                     self.record(1, true);
+                    if c == 0xF9 {
+                        reply(&mut self.master, &[0x79]); // restarted
+                    }
                 }
                 1..=0xF0 => {
                     self.record(1, false);
@@ -332,33 +339,31 @@ impl Machine {
         lock(&self.report).image = Some(im);
     }
 
-    /// Reports some of the black pixels as positions, then the end of the job.
+    /// Reports every burnt pixel as a position, then the end of the job.
     fn engrave(&mut self) {
         let image = {
             let mut report = lock(&self.report);
             report.started += 1;
-            if report.image.is_none() {
-                report.errors.push("start without an image".to_owned());
+            match report.image.clone() {
+                Some(image) => report.jobs.push(image.clone()),
+                None => report.errors.push("start without an image".to_owned()),
             }
             report.image.clone()
         };
         let Ok(mut master) = self.master.try_clone_native() else {
             return;
         };
-        let (v10, max_points) = (self.is_v10(), self.options.max_points);
+        let v10 = self.is_v10();
+        let (pixel_delay, restart_after) = (self.options.pixel_delay, self.options.restart_after);
         let stop = Arc::clone(&self.stop);
         thread::spawn(move || {
-            let points = image.iter().flat_map(|im| {
-                let side = 490.min(im.width().min(im.height()) as usize);
-                (0..side).step_by(PROGRESS_STEP).flat_map(move |y| {
-                    (0..side)
-                        .step_by(PROGRESS_STEP)
-                        .filter(move |&x| im.get_pixel(x as u32, y as u32).0[0] == 0)
-                        .map(move |x| (x, y))
-                })
-            });
-            for (x, y) in points.take(max_points) {
+            let points = image.as_ref().map(scan_order).unwrap_or_default();
+            for (n, (x, y)) in points.into_iter().enumerate() {
                 if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if restart_after == Some(n) {
+                    reply(&mut master, &[0x79]);
                     return;
                 }
                 let (xh, xl, yh, yl) = ((x / 100) as u8, (x % 100) as u8, (y / 100) as u8, (y % 100) as u8);
@@ -367,9 +372,31 @@ impl Machine {
                 } else {
                     reply(&mut master, &[255, 3, xh, xl, 255, 4, yh, yl]);
                 }
-                thread::sleep(Duration::from_millis(1));
+                if !pixel_delay.is_zero() {
+                    thread::sleep(pixel_delay);
+                }
             }
             reply(&mut master, if v10 { &[0x66] } else { &[255, 6, 0, 0] });
         });
     }
+}
+
+/// The burnt pixels of the 490×490 area in the order the firmware engraves them: rows from
+/// the top, alternating direction (the first one right to left), white rows skipped.
+fn scan_order(image: &GrayImage) -> Vec<(u32, u32)> {
+    let side = 490.min(image.width().min(image.height()));
+    let mut points = Vec::new();
+    let mut leftwards = true;
+    for y in 0..side {
+        let mut row: Vec<(u32, u32)> = (0..side).filter(|&x| image.get_pixel(x, y).0[0] == 0).map(|x| (x, y)).collect();
+        if row.is_empty() {
+            continue;
+        }
+        if leftwards {
+            row.reverse();
+        }
+        leftwards = !leftwards;
+        points.extend(row);
+    }
+    points
 }

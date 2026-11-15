@@ -179,3 +179,83 @@ fn listening_sends_nothing() {
     assert!(!engraver.acknowledged());
     assert!(sim.report().received.is_empty(), "a passive session must not write to the port");
 }
+
+/// A thin line far to the left of a block: worth two jobs.
+fn far_apart() -> GrayImage {
+    GrayImage::from_fn(490, 490, |x, y| {
+        let line = (60..63).contains(&x) && (100..400).contains(&y);
+        let block = (330..360).contains(&x) && (150..200).contains(&y);
+        Luma([if line || block { 0 } else { 255 }])
+    })
+}
+
+#[test]
+fn split_mode_engraves_one_job_after_the_other() {
+    let sim = simulator(Version::V10, 300);
+    let source = temp_file("far-apart.png");
+    far_apart().save(&source).unwrap();
+    let out = neje(
+        &sim,
+        &["engrave", source.to_str().unwrap(), "--print-mode", "split", "--burn", "40", "--erase-wait", "0.5", "--yes"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "neje failed: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("Job 2/2"), "{stdout}");
+    let report = sim.report();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.jobs.len(), 2, "two uploads, two starts");
+    // No restart (F9) between the jobs, or they would not line up on the piece.
+    assert!(!report.moves.contains(&"f9".to_owned()));
+    let burnt = |job: &GrayImage, x: u32, y: u32| job.get_pixel(x, y).0[0] == 0;
+    assert!(burnt(&report.jobs[0], 61, 200) && !burnt(&report.jobs[0], 340, 170));
+    assert!(burnt(&report.jobs[1], 340, 170) && !burnt(&report.jobs[1], 61, 200));
+}
+
+#[test]
+fn upload_refuses_a_plan_with_several_jobs() {
+    let sim = simulator(Version::V10, 100);
+    let source = temp_file("far-apart-upload.png");
+    far_apart().save(&source).unwrap();
+    let out = neje(&sim, &["upload", source.to_str().unwrap(), "--print-mode", "split"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("neje engrave"));
+}
+
+#[test]
+fn a_restart_during_the_job_is_an_error() {
+    let options = Options { erase_time: Duration::from_millis(200), restart_after: Some(50), ..Options::default() };
+    let sim = Simulator::start(options).unwrap();
+    let source = temp_file("marker-restart.png");
+    marker().save(&source).unwrap();
+    let out = neje(&sim, &["engrave", source.to_str().unwrap(), "--erase-wait", "0.4", "--timeout", "20", "--yes"]);
+    assert!(!out.status.success(), "a job cut short by a restart must not look finished");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("restarted"));
+}
+
+#[test]
+fn preview_compares_the_print_modes() {
+    let source = temp_file("far-apart-preview.png");
+    far_apart().save(&source).unwrap();
+    let output = temp_file("far-apart-out.png");
+    let plan = temp_file("far-apart-plan.png");
+    let prefix = temp_file("far-apart-job");
+    let out = Process::new(env!("CARGO_BIN_EXE_neje"))
+        .args(["--lang", "en", "preview", source.to_str().unwrap(), "--print-mode", "split", "--burn", "40"])
+        .args([
+            "-o",
+            output.to_str().unwrap(),
+            "--plan-image",
+            plan.to_str().unwrap(),
+            "--jobs",
+            prefix.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    for mode in ["Single job", "Split in jobs", "Line art"] {
+        assert!(stdout.contains(mode), "{mode} missing in: {stdout}");
+    }
+    assert!(plan.exists());
+    assert_eq!(image::open(format!("{}-2.png", prefix.display())).unwrap().into_luma8().dimensions(), (490, 490));
+}

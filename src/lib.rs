@@ -6,6 +6,7 @@
 //! - [`imaging`]: shrink to the work area, grey, Otsu, NEJE dithering, canvas operations;
 //! - [`gcode`]: G-code to bitmap;
 //! - [`text`]: text to bitmap;
+//! - [`plan`]: print modes, job splitting and time estimates; [`stroke`]: line art;
 //! - [`compose`]: the image to engrave from the options shared by the CLI and the GUI;
 //! - [`device`]: serial port detection and the engraver session;
 //! - [`simulator`]: a virtual engraver on a pseudo-terminal (Unix).
@@ -18,8 +19,10 @@ pub mod gcode;
 pub mod i18n;
 pub mod imaging;
 pub mod messages;
+pub mod plan;
 pub mod protocol;
 mod resample;
 #[cfg(unix)]
 pub mod simulator;
+pub mod stroke;
 pub mod text;
