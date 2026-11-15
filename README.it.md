@@ -198,8 +198,8 @@ durante la cancellazione.
 
 ## Crediti
 
-- Daniele ([deddroid](https://github.com/deddroid)), proprietario dell'incisore, che ha
-  fatto le prove sulla macchina.
+- [deddroid](https://github.com/deddroid), proprietario dell'incisore, che ha fatto le prove
+  sulla macchina.
 - Claude (Anthropic), che ha scritto il codice con lui.
 - Il protocollo viene dal programma ufficiale NEJE V3.6, studiato per l'interoperabilità, ed
   è stato confrontato con [EzGraver](https://github.com/camrein/EzGraver) e

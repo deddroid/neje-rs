@@ -194,7 +194,7 @@ saves the image it receives and reports protocol mistakes such as data sent duri
 
 ## Credits
 
-- Daniele ([deddroid](https://github.com/deddroid)), who owns the engraver and ran the tests on it.
+- [deddroid](https://github.com/deddroid), who owns the engraver and ran the tests on it.
 - Claude (Anthropic), which wrote the code with him.
 - The protocol comes from the official NEJE V3.6 program, studied for interoperability, and
   was cross-checked with [EzGraver](https://github.com/camrein/EzGraver) and
