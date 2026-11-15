@@ -104,7 +104,7 @@ enum SimProtocol {
 
 #[derive(Args)]
 struct ImageArgs {
-    /// Picture to engrave (JPEG, PNG, BMP, GIF, TIFF, WebP)
+    /// Picture to engrave (JPEG, PNG, BMP, GIF, TIFF, WebP) or G-code file
     image: Option<PathBuf>,
     /// How the picture becomes black and white
     #[arg(long, value_enum, default_value = "bw")]
@@ -155,14 +155,19 @@ impl ImageArgs {
     }
 
     fn job(&self) -> Job {
+        // A G-code file given where the picture goes is a drawing, like in the window.
+        let (image, gcode) = match (&self.image, &self.gcode) {
+            (Some(path), None) if neje::gcode::is_gcode_path(path) => (None, Some(path.clone())),
+            (image, gcode) => (image.clone(), gcode.clone()),
+        };
         Job {
-            image: self.image.clone(),
+            image,
             mode: match self.mode {
                 ModeArg::Bw => Mode::Bw,
                 ModeArg::Dither => Mode::Dither,
                 ModeArg::GrayThreshold => Mode::GrayThreshold,
             },
-            gcode: self.gcode.clone(),
+            gcode,
             gcode_fit: self.fit,
             gcode_line_px: self.line,
             rotate: self.rotate,

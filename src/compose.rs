@@ -15,8 +15,8 @@ pub enum ComposeError {
     Image(#[from] ImageError),
     #[error(transparent)]
     Text(#[from] TextError),
-    #[error("cannot read G-code file {path}: {source}")]
-    Gcode { path: String, source: std::io::Error },
+    #[error("cannot read G-code file {path}: {cause}")]
+    Gcode { path: String, cause: std::io::Error },
 }
 
 /// Text to add on top of the image.
@@ -58,8 +58,8 @@ impl Job {
     pub fn build(&self, base_size: u32) -> Result<GrayImage, ComposeError> {
         let mut base = new_base(base_size);
         if let Some(path) = &self.gcode {
-            let bytes = std::fs::read(path)
-                .map_err(|source| ComposeError::Gcode { path: path.display().to_string(), source })?;
+            let bytes =
+                std::fs::read(path).map_err(|cause| ComposeError::Gcode { path: path.display().to_string(), cause })?;
             base = gcode::rasterize(
                 &String::from_utf8_lossy(&bytes),
                 base_size,

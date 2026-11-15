@@ -22,6 +22,14 @@ use crate::imaging;
 /// Pitch declared by NEJE: 490 px × 0.075 mm = 36.75 mm.
 pub const MM_PER_PX: f64 = 0.075;
 
+/// File extensions of G-code programs.
+pub const EXTENSIONS: [&str; 5] = ["nc", "gcode", "gc", "ngc", "tap"];
+
+/// True when `path` has one of the G-code [`EXTENSIONS`].
+pub fn is_gcode_path(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
 /// Empty border left around the drawing when it is scaled to fit.
 const FIT_MARGIN_PX: f64 = 5.0;
 

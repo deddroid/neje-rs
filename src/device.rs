@@ -34,8 +34,8 @@ const CONNECT_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceError {
-    #[error("cannot open {port}: {source}{hint}", hint = access_hint(.source))]
-    Open { port: String, source: serialport::Error },
+    #[error("cannot open {port}: {cause}{hint}", hint = access_hint(.cause))]
+    Open { port: String, cause: serialport::Error },
     #[error("cannot list the serial ports: {0}")]
     List(serialport::Error),
     #[error("engraver not found{}", not_found_details(.tried))]
@@ -48,8 +48,8 @@ pub enum DeviceError {
     EraseTimeout,
 }
 
-fn access_hint(source: &serialport::Error) -> &'static str {
-    if matches!(source.kind(), serialport::ErrorKind::Io(io::ErrorKind::PermissionDenied)) {
+fn access_hint(cause: &serialport::Error) -> &'static str {
+    if matches!(cause.kind(), serialport::ErrorKind::Io(io::ErrorKind::PermissionDenied)) {
         " (install the udev rule of this project, or add your user to the group that owns the port: \"uucp\" on Arch, \"dialout\" on Debian/Ubuntu)"
     } else {
         ""
@@ -126,7 +126,7 @@ fn open(port: &str) -> Result<Box<dyn SerialPort>, DeviceError> {
         .flow_control(FlowControl::None)
         .timeout(READ_TIMEOUT)
         .open()
-        .map_err(|source| DeviceError::Open { port: port.to_owned(), source })?;
+        .map_err(|cause| DeviceError::Open { port: port.to_owned(), cause })?;
     // Like .NET SerialPort (DtrEnable = RtsEnable = false). Pseudo-terminals have no modem
     // lines and refuse the request, which is harmless.
     let _ = serial.write_data_terminal_ready(false);
@@ -293,7 +293,7 @@ impl Engraver {
     /// what the engraver says on its own.
     pub fn listen(port: &str, protocol: Protocol) -> Result<Self, DeviceError> {
         let writer = open(port)?;
-        let reader_port = writer.try_clone().map_err(|source| DeviceError::Open { port: port.to_owned(), source })?;
+        let reader_port = writer.try_clone().map_err(|cause| DeviceError::Open { port: port.to_owned(), cause })?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State { protocol, connected: false, erase_done: false }),
             changed: Condvar::new(),

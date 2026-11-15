@@ -13,8 +13,8 @@ use crate::resample;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {
-    #[error("cannot open image {path}: {source}")]
-    Open { path: String, source: image::ImageError },
+    #[error("cannot open image {path}: {cause}")]
+    Open { path: String, cause: image::ImageError },
 }
 
 /// How a photo becomes black and white.
@@ -37,7 +37,7 @@ impl Mode {
 /// comes from the content, not from the extension: the NEJE clipart are PNG files named
 /// `.bmp`. Transparent pixels are laid on white (the original turned them black via GDI+).
 pub fn load(path: &Path) -> Result<RgbImage, ImageError> {
-    let open_error = |source| ImageError::Open { path: path.display().to_string(), source };
+    let open_error = |cause| ImageError::Open { path: path.display().to_string(), cause };
     let reader =
         image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map_err(|e| open_error(e.into()))?;
     Ok(flatten(reader.decode().map_err(open_error)?))

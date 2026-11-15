@@ -13,7 +13,7 @@ optdepends=('wayland: native Wayland window'
             'xdg-desktop-portal: file dialogs of the window')
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('8299521bbb128ccba60f32aba4c6ad6aea8a40f3a3d0bfe40f36cc19738e7eb0')
 
 prepare() {
   cd "neje-rs-$pkgver"
