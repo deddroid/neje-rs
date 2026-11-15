@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke};
 use image::{GrayImage, RgbImage};
 use neje::device::{self, PortInfo};
+use neje::doctor::{self, Problem};
 use neje::i18n::{self, Lang, tr};
 use neje::imaging::{self, Mode};
-use neje::messages::{describe, laser_checklist, mode_description};
+use neje::messages::{describe, laser_checklist, mode_description, problem_fix_label, problem_text, problem_title};
 use neje::plan::{self, Plan, PrintMode};
 use neje::protocol::{BURN_MAX, BURN_MIN, Command, Direction, Event, MEASURED_MM_PER_PX, Protocol, Version};
 use neje::{gcode, text};
@@ -129,12 +130,22 @@ enum Picked {
     Image(PathBuf),
     Gcode(PathBuf),
     SavePreview(PathBuf),
+    /// Outcome of the fix of a system problem.
+    Fixed(Result<(), String>),
+}
+
+/// What a screenshot shows besides the window.
+#[derive(Clone, Copy, PartialEq)]
+enum Extra {
+    Nothing,
+    LaserDialog,
+    /// The banner about a missing permission.
+    Banner,
 }
 
 struct Screenshots {
     dir: PathBuf,
-    /// Theme, language and whether the laser confirmation is open.
-    steps: Vec<(egui::Theme, Lang, bool)>,
+    steps: Vec<(egui::Theme, Lang, Extra)>,
     index: usize,
     frames: u32,
     requested: bool,
@@ -155,8 +166,17 @@ pub struct App {
     /// `base` prepared for each print mode, in the order of [`ModeKind::ALL`].
     plans: [Plan; 3],
     thumbnails: [egui::TextureHandle; 3],
+    /// Pictures of `plans`, kept to redraw the preview when the selection changes.
+    pictures: [egui::ColorImage; 3],
     /// Set when `base`, the burn time, the stroke or the protocol change.
     plans_dirty: bool,
+    /// The plans are computed by a thread of their own: the thinning and the search of the
+    /// bands take up to a tenth of a second, too long for the window.
+    planner: Sender<PlanRequest>,
+    planned: Receiver<PlanResult>,
+    /// Number of the last request sent to the planner and of the last result applied.
+    requested: u64,
+    applied: u64,
     /// The picture as opened, to convert it again when the mode changes.
     original: Option<RgbImage>,
     mode: Mode,
@@ -166,6 +186,10 @@ pub struct App {
     text_dialog: Option<TextDraft>,
 
     link: Link,
+    /// What the system lacks for the engraver (driver, permission), shown as a banner.
+    problems: Vec<Problem>,
+    /// True while the fix of a problem is running.
+    fixing: bool,
     ports: Vec<PortInfo>,
     port_choice: Option<String>,
     protocol_choice: ProtocolChoice,
@@ -190,6 +214,36 @@ pub struct App {
     picked_tx: Sender<Picked>,
     picked_rx: Receiver<Picked>,
     shots: Option<Screenshots>,
+}
+
+struct PlanRequest {
+    number: u64,
+    base: GrayImage,
+    stroke: u8,
+    burn: u8,
+    protocol: Protocol,
+}
+
+struct PlanResult {
+    number: u64,
+    plans: [Plan; 3],
+    pictures: [egui::ColorImage; 3],
+}
+
+/// Computes the plans asked through `requests`, skipping those already superseded.
+fn planner(requests: &Receiver<PlanRequest>, results: &Sender<PlanResult>, ctx: &egui::Context) {
+    while let Ok(mut request) = requests.recv() {
+        while let Ok(newer) = requests.try_recv() {
+            request = newer;
+        }
+        let PlanRequest { number, base, stroke, burn, protocol } = request;
+        let plans = ModeKind::ALL.map(|kind| Plan::new(&base, kind.mode(stroke), burn, protocol));
+        let pictures = [plan_picture(&plans[0]), plan_picture(&plans[1]), plan_picture(&plans[2])];
+        if results.send(PlanResult { number, plans, pictures }).is_err() {
+            return; // the window is gone
+        }
+        ctx.request_repaint();
+    }
 }
 
 fn plan_picture(plan: &Plan) -> egui::ColorImage {
@@ -219,18 +273,29 @@ impl App {
         let burn = settings.burn.clamp(BURN_MIN, BURN_MAX);
         let stroke = startup.stroke.unwrap_or(1).clamp(1, plan::MAX_STROKE);
         let plans = ModeKind::ALL.map(|kind| Plan::new(&base, kind.mode(stroke), burn, protocol));
-        let load =
-            |name: &str, plan: &Plan| cc.egui_ctx.load_texture(name, plan_picture(plan), egui::TextureOptions::LINEAR);
-        let texture = load("preview", &plans[0]);
-        let thumbnails = [load("single", &plans[0]), load("split", &plans[1]), load("line", &plans[2])];
+        let pictures = [plan_picture(&plans[0]), plan_picture(&plans[1]), plan_picture(&plans[2])];
+        let load = |name: &str, picture: &egui::ColorImage| {
+            cc.egui_ctx.load_texture(name, picture.clone(), egui::TextureOptions::LINEAR)
+        };
+        let texture = load("preview", &pictures[0]);
+        let thumbnails = [load("single", &pictures[0]), load("split", &pictures[1]), load("line", &pictures[2])];
+        let (planner_tx, planner_rx) = mpsc::channel();
+        let (planned_tx, planned) = mpsc::channel();
+        let planner_ctx = cc.egui_ctx.clone();
+        std::thread::spawn(move || planner(&planner_rx, &planned_tx, &planner_ctx));
         let (picked_tx, picked_rx) = mpsc::channel();
         let shots = startup.screenshots.map(|dir| {
             let (tx, rx) = mpsc::channel();
             let mut steps: Vec<_> = [egui::Theme::Dark, egui::Theme::Light]
                 .into_iter()
-                .flat_map(|theme| Lang::ALL.map(|lang| (theme, lang, false)))
+                .flat_map(|theme| Lang::ALL.map(|lang| (theme, lang, Extra::Nothing)))
                 .collect();
-            steps.extend([(egui::Theme::Dark, Lang::En, true), (egui::Theme::Light, Lang::It, true)]);
+            steps.extend([
+                (egui::Theme::Dark, Lang::En, Extra::LaserDialog),
+                (egui::Theme::Light, Lang::It, Extra::LaserDialog),
+                (egui::Theme::Dark, Lang::En, Extra::Banner),
+                (egui::Theme::Light, Lang::It, Extra::Banner),
+            ]);
             Screenshots { dir, steps, index: 0, frames: 0, requested: false, tx, rx }
         });
         let mut app = App {
@@ -243,13 +308,20 @@ impl App {
             stroke,
             plans,
             thumbnails,
+            pictures,
             plans_dirty: true,
+            planner: planner_tx,
+            planned,
+            requested: 0,
+            applied: 0,
             original: None,
             mode: Mode::Bw,
             gcode_fit: true,
             pending_text: None,
             text_dialog: None,
             link: Link::Disconnected,
+            problems: Vec::new(),
+            fixing: false,
             ports: Vec::new(),
             port_choice: startup.port.clone(),
             protocol_choice: startup.protocol.unwrap_or(ProtocolChoice::V10),
@@ -311,21 +383,50 @@ impl App {
 
     /// The plan of the selected print mode.
     fn plan(&self) -> &Plan {
-        &self.plans[ModeKind::ALL.iter().position(|&k| k == self.print_mode).unwrap_or(0)]
+        &self.plans[self.selected()]
     }
 
-    /// Prepares the image again for the three print modes and redraws their pictures.
+    fn selected(&self) -> usize {
+        ModeKind::ALL.iter().position(|&k| k == self.print_mode).unwrap_or(0)
+    }
+
+    /// False while the plans shown are older than the image, the burn time or the stroke.
+    fn plans_ready(&self) -> bool {
+        !self.plans_dirty && self.applied == self.requested
+    }
+
+    /// Asks the planner for new plans when something changed, and applies its answers.
     fn refresh_plans(&mut self) {
-        if !self.plans_dirty {
-            return;
+        if self.plans_dirty {
+            self.plans_dirty = false;
+            self.requested += 1;
+            let request = PlanRequest {
+                number: self.requested,
+                base: self.base.clone(),
+                stroke: self.stroke,
+                burn: self.burn,
+                protocol: self.protocol().unwrap_or(Protocol::new(Version::V10, None)),
+            };
+            // The planner lives as long as the window.
+            let _ = self.planner.send(request);
         }
-        self.plans_dirty = false;
-        let protocol = self.protocol().unwrap_or(Protocol::new(Version::V10, None));
-        self.plans = ModeKind::ALL.map(|kind| Plan::new(&self.base, kind.mode(self.stroke), self.burn, protocol));
-        for (thumbnail, plan) in self.thumbnails.iter_mut().zip(&self.plans) {
-            thumbnail.set(plan_picture(plan), egui::TextureOptions::LINEAR);
+        while let Ok(result) = self.planned.try_recv() {
+            if result.number != self.requested {
+                continue; // superseded while it was being computed
+            }
+            self.applied = result.number;
+            self.plans = result.plans;
+            self.pictures = result.pictures;
+            for (thumbnail, picture) in self.thumbnails.iter_mut().zip(&self.pictures) {
+                thumbnail.set(picture.clone(), egui::TextureOptions::LINEAR);
+            }
+            self.show_selected_plan();
         }
-        self.texture.set(plan_picture(self.plan()), egui::TextureOptions::LINEAR);
+    }
+
+    /// Draws the plan of the selected print mode in the preview.
+    fn show_selected_plan(&mut self) {
+        self.texture.set(self.pictures[self.selected()].clone(), egui::TextureOptions::LINEAR);
         self.update_image_sent();
     }
 
@@ -352,11 +453,35 @@ impl App {
         self.set_base(base);
     }
 
+    /// Lists the ports again and checks driver and permissions (reads `/sys`, opens nothing).
     fn refresh_ports(&mut self) {
         match device::ports() {
             Ok(ports) => self.ports = ports,
             Err(e) => self.log_error(e),
         }
+        if self.shots.is_none() {
+            self.problems = doctor::check();
+        }
+    }
+
+    /// Runs the fix of `problem` as administrator, in its own thread: the password window
+    /// can stay open for a long time.
+    fn fix(&mut self, ctx: &egui::Context, problem: &Problem) {
+        let Some(fix) = problem.fix() else { return };
+        let Some(elevator) = doctor::elevator(true) else {
+            self.log_error(tr(
+                "neither pkexec nor sudo found: run \"neje doctor --fix\" as administrator",
+                "né pkexec né sudo trovati: esegui \"neje doctor --fix\" come amministratore",
+            ));
+            return;
+        };
+        self.fixing = true;
+        let (tx, ctx) = (self.picked_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            // The window may have closed meanwhile; then the outcome no longer matters.
+            let _ = tx.send(Picked::Fixed(fix.run(elevator)));
+            ctx.request_repaint();
+        });
     }
 
     fn connect(&mut self) {
@@ -501,6 +626,7 @@ impl App {
                     self.sequence = None;
                     if self.link == Link::Connecting {
                         self.link = Link::Disconnected;
+                        self.refresh_ports(); // a failed search may be a missing driver or permission
                     }
                     self.log_error(error);
                 }
@@ -545,7 +671,18 @@ impl App {
             match picked {
                 Picked::Image(path) => self.open_image(&path),
                 Picked::Gcode(path) => self.open_gcode(&path),
-                Picked::SavePreview(path) => match self.base.save(&path) {
+                Picked::Fixed(outcome) => {
+                    self.fixing = false;
+                    match outcome {
+                        Ok(()) => self.log(tr(
+                            "Done. If the engraver is still not found, unplug it and plug it in again.",
+                            "Fatto. Se l'incisore non viene ancora trovato, scollegalo e ricollegalo.",
+                        )),
+                        Err(e) => self.log_error(e),
+                    }
+                    self.refresh_ports();
+                }
+                Picked::SavePreview(path) => match self.plan().image.save(&path) {
                     Ok(()) => {
                         self.log(format!("{} {}", tr("Preview saved in", "Anteprima salvata in"), path.display()))
                     }
@@ -560,7 +697,7 @@ impl App {
     }
 
     fn screenshot_step(&mut self, ctx: &egui::Context) {
-        let connecting = self.link == Link::Connecting;
+        let connecting = self.link == Link::Connecting || !self.plans_ready();
         let laser = if self.plan().jobs.len() > 1 { LaserAction::Jobs } else { LaserAction::Start };
         let Some(s) = self.shots.as_mut() else { return };
         ctx.request_repaint();
@@ -568,9 +705,14 @@ impl App {
             return; // wait for the engraver, so the picture shows the connected state
         }
         if let Ok(image) = s.rx.try_recv() {
-            let (theme, lang, dialog) = s.steps[s.index];
+            let (theme, lang, extra) = s.steps[s.index];
             let theme = if theme == egui::Theme::Dark { "dark" } else { "light" };
-            let path = s.dir.join(format!("{}_{theme}{}.png", lang.code(), if dialog { "_laser" } else { "" }));
+            let suffix = match extra {
+                Extra::Nothing => "",
+                Extra::LaserDialog => "_laser",
+                Extra::Banner => "_banner",
+            };
+            let path = s.dir.join(format!("{}_{theme}{suffix}.png", lang.code()));
             let [w, h] = image.size;
             if let Err(e) = image::save_buffer(&path, image.as_raw(), w as u32, h as u32, image::ColorType::Rgba8) {
                 eprintln!("{}: {e}", path.display());
@@ -579,13 +721,18 @@ impl App {
             s.frames = 0;
             s.requested = false;
         }
-        let Some(&(theme, lang, dialog)) = s.steps.get(s.index) else {
+        let Some(&(theme, lang, extra)) = s.steps.get(s.index) else {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         };
         ctx.set_theme(theme);
         i18n::set(lang);
-        self.confirm = dialog.then_some(laser);
+        self.confirm = (extra == Extra::LaserDialog).then_some(laser);
+        self.problems = if extra == Extra::Banner {
+            vec![Problem::NoAccess { port: "/dev/ttyUSB0".to_owned() }]
+        } else {
+            Vec::new()
+        };
         s.frames += 1;
         if s.frames >= 5 && !s.requested {
             s.requested = true;
@@ -719,7 +866,7 @@ impl App {
                     let response = response.on_hover_text(mode_description(kind.mode(self.stroke)));
                     if response.clicked() && !selected {
                         self.print_mode = kind;
-                        self.plans_dirty = true;
+                        self.show_selected_plan();
                     }
                 }
                 ui.add_space(8.0);
@@ -787,9 +934,13 @@ impl App {
         let painter = ui.painter_at(rect);
         let trace = palette(ui).err;
         let dot = scale.max(1.0);
+        // One mesh for all the dots: tens of thousands of separate shapes would cost a
+        // tessellation each, at every frame of a long engraving.
+        let mut mesh = egui::Mesh::default();
         for &point in &self.dots {
-            painter.rect_filled(egui::Rect::from_center_size(to_screen(point), egui::vec2(dot, dot)), 0.0, trace);
+            mesh.add_colored_rect(egui::Rect::from_center_size(to_screen(point), egui::vec2(dot, dot)), trace);
         }
+        painter.add(egui::Shape::mesh(mesh));
         if let Some(head) = self.position {
             painter.circle_stroke(to_screen(head), 6.0, Stroke::new(2.0, palette(ui).accent));
         }
@@ -837,7 +988,46 @@ impl App {
 
     // ---- controls --------------------------------------------------------------------
 
+    /// One card per thing the system lacks, with the button that provides it.
+    fn banner(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        let ctx = ui.ctx().clone();
+        for problem in self.problems.clone() {
+            let width = ui.available_width();
+            egui::Frame::new()
+                .fill(p.surface)
+                .stroke(Stroke::new(1.0, p.warn))
+                .corner_radius(CornerRadius::same(16))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_width(width - 26.0);
+                    ui.add(egui::Label::new(RichText::new(problem_title(&problem)).color(p.warn).strong()).wrap());
+                    ui.add(egui::Label::new(theme::dim(problem_text(&problem))).wrap());
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if self.fixing {
+                            ui.spinner();
+                            ui.label(theme::dim(tr(
+                                "Waiting for the administrator password...",
+                                "In attesa della password di amministratore...",
+                            )));
+                            return;
+                        }
+                        if problem.fix().is_some() && ui.add(theme::primary(ui, problem_fix_label(&problem))).clicked()
+                        {
+                            self.fix(&ctx, &problem);
+                        }
+                        if ui.button(tr("Check again", "Controlla di nuovo")).clicked() {
+                            self.refresh_ports();
+                        }
+                    });
+                });
+            ui.add_space(8.0);
+        }
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui) {
+        self.banner(ui);
         self.group_engraver(ui);
         self.group_image(ui);
         self.group_engraving(ui);
@@ -862,7 +1052,10 @@ impl App {
                     if let Some(choice) = theme::choice(ui, "port", &self.port_choice, &options) {
                         self.port_choice = choice;
                     }
-                    if ui.button("⟳").on_hover_text(tr("Look for ports again", "Cerca di nuovo le porte")).clicked() {
+                    if theme::refresh_button(ui)
+                        .on_hover_text(tr("Look for ports again", "Cerca di nuovo le porte"))
+                        .clicked()
+                    {
                         self.refresh_ports();
                     }
                 });
@@ -966,6 +1159,8 @@ impl App {
         let protocol = self.protocol();
         let connected = protocol.is_some();
         let idle = connected && self.upload.is_none();
+        // Nothing is sent while the plan on screen is being recomputed.
+        let ready = idle && self.plans_ready();
         let need = tr("Connect the engraver first", "Prima collega l'incisore");
         let can = |command: Command| protocol.is_some_and(|p| p.encode(command).is_ok());
         theme::group(ui, tr("Engraving", "Incisione"), |ui| {
@@ -999,7 +1194,7 @@ impl App {
                     // One button for the whole sequence: upload, engrave, next job.
                     let label = format!("{} {jobs} {}", tr("Engrave in", "Incidi in"), tr("jobs", "lavori"));
                     let button = theme::primary(ui, &label).min_size(egui::vec2(width, theme::CONTROL_HEIGHT));
-                    if ui.add_enabled(idle, button).on_disabled_hover_text(need).clicked() {
+                    if ui.add_enabled(ready, button).on_disabled_hover_text(need).clicked() {
                         self.confirm = Some(LaserAction::Jobs);
                     }
                     return;
@@ -1012,7 +1207,7 @@ impl App {
                 // The next step of the job is the one accent button of the window.
                 let button = if self.image_sent { egui::Button::new(label) } else { theme::primary(ui, label) };
                 let response =
-                    ui.add_enabled(idle && !empty, button.min_size(egui::vec2(width, theme::CONTROL_HEIGHT)));
+                    ui.add_enabled(ready && !empty, button.min_size(egui::vec2(width, theme::CONTROL_HEIGHT)));
                 if response.on_disabled_hover_text(if connected { nothing } else { need }).clicked() {
                     let image = self.plan().jobs[0].image.clone();
                     self.upload = Some(0.0);

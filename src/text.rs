@@ -14,16 +14,14 @@ use crate::imaging;
 const LINE_GAP: f32 = 4.0;
 const BORDER: i32 = 2;
 
-/// Fonts tried when none is given, in order.
-const DEFAULT_FONTS: [&str; 5] =
-    ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "NotoSans-Regular.ttf", "arial.ttf", "Arial.ttf"];
+/// Font used when none is given: Inter, built into the program, so that text works on
+/// every system without looking for installed fonts.
+const BUILT_IN_FONT: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
 
 #[derive(Debug, thiserror::Error)]
 pub enum TextError {
     #[error("font \"{0}\" not found: pass the path of a .ttf or .otf file")]
     FontNotFound(String),
-    #[error("no usable font found on this system: pass the path of a .ttf or .otf file")]
-    NoDefaultFont,
     #[error("cannot read font {path}: {reason}")]
     BadFont { path: String, reason: String },
 }
@@ -62,29 +60,35 @@ fn find_in(dir: &Path, name: &str, depth: u32) -> Option<PathBuf> {
     subdirs.iter().find_map(|d| find_in(d, name, depth - 1))
 }
 
-/// Path of the font: `name` as a file path, or as a file name in the system font folders;
-/// without a name, the first of the default fonts that exists.
-pub fn find_font(name: Option<&str>) -> Result<PathBuf, TextError> {
-    let lookup = |name: &str| {
-        let direct = Path::new(name);
-        if direct.is_file() {
-            return Some(direct.to_path_buf());
-        }
-        font_dirs().iter().find_map(|dir| find_in(dir, name, 4))
-    };
-    match name {
-        Some(name) => lookup(name).ok_or_else(|| TextError::FontNotFound(name.to_owned())),
-        None => DEFAULT_FONTS.iter().find_map(|name| lookup(name)).ok_or(TextError::NoDefaultFont),
+/// Path of the font called `name`: a file path, or a file name in the system font folders.
+pub fn find_font(name: &str) -> Result<PathBuf, TextError> {
+    let direct = Path::new(name);
+    if direct.is_file() {
+        return Ok(direct.to_path_buf());
     }
+    font_dirs().iter().find_map(|dir| find_in(dir, name, 4)).ok_or_else(|| TextError::FontNotFound(name.to_owned()))
 }
 
-/// Renders `text` with an em size of `size` pixels. Lines are separated by a newline or by
+/// The font to draw with: the file called `name`, or the built-in one.
+fn load_font(name: Option<&str>) -> Result<FontVec, TextError> {
+    let (bytes, origin) = match name {
+        Some(name) => {
+            let path = find_font(name)?;
+            let origin = path.display().to_string();
+            let bytes =
+                std::fs::read(&path).map_err(|e| TextError::BadFont { path: origin.clone(), reason: e.to_string() })?;
+            (bytes, origin)
+        }
+        None => (BUILT_IN_FONT.to_vec(), "built-in".to_owned()),
+    };
+    FontVec::try_from_vec(bytes).map_err(|e| TextError::BadFont { path: origin, reason: e.to_string() })
+}
+
+/// Renders `text` with an em size of `size` pixels, in the font called `font` (see
+/// [`find_font`]) or in the built-in Inter. Lines are separated by a newline or by
 /// the two characters `\n` (handy on the command line).
 pub fn render(text: &str, font: Option<&str>, size: u32) -> Result<GrayImage, TextError> {
-    let path = find_font(font)?;
-    let bad_font = |reason: String| TextError::BadFont { path: path.display().to_string(), reason };
-    let bytes = std::fs::read(&path).map_err(|e| bad_font(e.to_string()))?;
-    let font = FontVec::try_from_vec(bytes).map_err(|e| bad_font(e.to_string()))?;
+    let font = load_font(font)?;
     // `PxScale` is the ascent-to-descent height; `size` is the em size, as in FreeType.
     let em = font.units_per_em().unwrap_or(1000.0);
     let scaled = font.as_scaled(PxScale::from(size as f32 * font.height_unscaled() / em));
@@ -131,4 +135,41 @@ pub fn render(text: &str, font: Option<&str>, size: u32) -> Result<GrayImage, Te
         });
     }
     Ok(imaging::bw_otsu(&im))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn black(im: &GrayImage) -> usize {
+        im.pixels().filter(|p| p.0[0] == 0).count()
+    }
+
+    #[test]
+    fn built_in_font_draws_text() {
+        let one = render("NEJE", None, 48).unwrap();
+        assert!(one.width() > 80 && one.height() > 30, "{:?}", one.dimensions());
+        assert!(black(&one) > 500);
+        let two = render("NEJE\\nDK-8", None, 48).unwrap();
+        assert!(two.height() > one.height() + 30, "the second line is missing");
+    }
+
+    #[test]
+    fn empty_text_is_a_white_pixel() {
+        assert_eq!(black(&render("", None, 48).unwrap()), 0);
+    }
+
+    #[test]
+    fn missing_font_is_reported() {
+        assert!(matches!(render("x", Some("no-such-font-here.ttf"), 20), Err(TextError::FontNotFound(_))));
+    }
+
+    #[test]
+    fn symbols_of_the_window_are_in_the_built_in_font() {
+        // The window draws its text with the same font; the rest comes from egui's own.
+        let font = ab_glyph::FontRef::try_from_slice(BUILT_IN_FONT).unwrap();
+        for c in "…×–•✓".chars() {
+            assert_ne!(font.glyph_id(c).0, 0, "Inter lacks {c:?}");
+        }
+    }
 }

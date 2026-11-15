@@ -12,9 +12,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use neje::compose::{Job, TextLayer};
 use neje::device::{self, Engraver};
+use neje::doctor;
 use neje::i18n::{self, Lang, tr};
 use neje::imaging::{self, Mode};
-use neje::messages::{describe, laser_checklist, mode_description, mode_name};
+use neje::messages::{
+    describe, laser_checklist, mode_description, mode_name, problem_fix_label, problem_text, problem_title,
+};
 use neje::plan::{self, Plan, PrintMode};
 use neje::protocol::{BURN_DEFAULT, BURN_MAX, BURN_MIN, Command, Direction, Event, Protocol, Version};
 
@@ -109,7 +112,8 @@ struct ImageArgs {
     /// Text to add (\n starts a new line)
     #[arg(long)]
     text: Option<String>,
-    /// Font file (.ttf/.otf) or file name in the system font folders
+    /// Font file (.ttf/.otf) or file name in the system font folders (default: the
+    /// built-in Inter)
     #[arg(long)]
     font: Option<String>,
     /// Text size in pixels
@@ -296,6 +300,12 @@ enum Cmd {
         /// Where to save the image the virtual engraver receives
         #[arg(short, long, default_value = "virtual-engraving.png")]
         output: PathBuf,
+    },
+    /// Check what the system lacks for the engraver (driver, permission on the port)
+    Doctor {
+        /// Solve what can be solved; asks for the administrator password
+        #[arg(long)]
+        fix: bool,
     },
     /// Open the graphical interface
     Gui,
@@ -688,6 +698,41 @@ fn simulate(_app: &App, _sim_protocol: SimProtocol, _output: PathBuf) -> Result<
     bail!("the virtual engraver needs a pseudo-terminal and is only available on Unix")
 }
 
+/// Lists what the system lacks and, with `fix`, solves it as root.
+fn doctor(fix: bool) -> Result<()> {
+    let problems = doctor::check();
+    if problems.is_empty() {
+        println!(
+            "{}",
+            tr(
+                "Nothing is missing. (An engraver that is not plugged in cannot be checked.)",
+                "Non manca nulla. (Un incisore non collegato non si può controllare.)"
+            )
+        );
+        return Ok(());
+    }
+    for problem in &problems {
+        println!("{}\n  {}", problem_title(problem), problem_text(problem));
+        let Some(solution) = problem.fix() else { continue };
+        if !fix {
+            println!("  {}: neje doctor --fix", problem_fix_label(problem));
+            continue;
+        }
+        let Some(elevator) = doctor::elevator(false) else {
+            bail!(tr("neither sudo nor pkexec found: run as root", "né sudo né pkexec trovati: esegui come root"));
+        };
+        solution.run(elevator).map_err(anyhow::Error::msg)?;
+        println!(
+            "  {}",
+            tr("Done. Unplug the engraver and plug it in again.", "Fatto. Scollega e ricollega l'incisore.")
+        );
+    }
+    if !fix {
+        bail!(tr("the engraver cannot be used yet", "l'incisore non si può ancora usare"));
+    }
+    Ok(())
+}
+
 /// Starts `neje-gui`, installed next to this program.
 fn gui(app: &App) -> Result<()> {
     let name = if cfg!(windows) { "neje-gui.exe" } else { "neje-gui" };
@@ -783,6 +828,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::SetBurn { value } => app.simple(Command::SetBurn(value)),
         Cmd::Monitor { passive } => monitor(&app, passive),
         Cmd::Simulate { sim_protocol, output } => simulate(&app, sim_protocol, output),
+        Cmd::Doctor { fix } => doctor(fix),
         Cmd::Gui => gui(&app),
     }
 }

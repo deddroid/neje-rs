@@ -47,12 +47,14 @@ impl Grid {
 /// Zhang–Suen thinning: peels the outline of every shape, alternating two passes, until
 /// only lines one pixel wide are left.
 fn thin(grid: &mut Grid) {
+    // Only the cells still black can change: the list shrinks as the shapes get thinner.
+    let mut alive: Vec<usize> = grid.inner().filter(|&i| grid.cells[i]).collect();
     loop {
         let mut changed = false;
         for second_pass in [false, true] {
-            let doomed: Vec<usize> = grid
-                .inner()
-                .filter(|&i| grid.cells[i])
+            let doomed: Vec<usize> = alive
+                .iter()
+                .copied()
                 .filter(|&i| {
                     let p = grid.neighbours(i);
                     let black = p.iter().filter(|&&b| b).count();
@@ -70,6 +72,7 @@ fn thin(grid: &mut Grid) {
             for i in doomed {
                 grid.cells[i] = false;
             }
+            alive.retain(|&i| grid.cells[i]);
         }
         if !changed {
             return;

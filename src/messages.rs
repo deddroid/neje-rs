@@ -1,5 +1,6 @@
 //! Texts shared by the command line and the window, in the current language.
 
+use crate::doctor::Problem;
 use crate::i18n::tr;
 use crate::plan::PrintMode;
 use crate::protocol::Event;
@@ -66,5 +67,45 @@ pub fn mode_description(mode: PrintMode) -> &'static str {
             "Shapes are reduced to their centre line and drawn with a stroke of a few pixels instead of being filled: one pass per pixel of width. Much faster for drawings, text and logos; not meant for photos. Split in several jobs when that is faster.",
             "Le forme vengono ridotte alla loro linea centrale e disegnate con un tratto di pochi pixel invece di essere riempite: una passata per ogni pixel di spessore. Molto più veloce per disegni, scritte e loghi; non adatta alle foto. Divisa in più lavori quando conviene.",
         ),
+    }
+}
+
+/// One line saying what the system lacks.
+pub fn problem_title(problem: &Problem) -> String {
+    match problem {
+        Problem::DriverNotBound { .. } => tr(
+            "The engraver is plugged in but has no serial port",
+            "L'incisore è collegato ma non ha una porta seriale",
+        )
+        .to_owned(),
+        Problem::NoAccess { port } => {
+            format!("{} {port}", tr("You are not allowed to open", "Non hai il permesso di aprire"))
+        }
+    }
+}
+
+/// Why it happens and what solves it.
+pub fn problem_text(problem: &Problem) -> &'static str {
+    match problem {
+        Problem::DriverNotBound { brltty: true } => tr(
+            "The braille service \"brltty\" is installed and takes the engraver's USB converter (CH340) for a braille display. Remove brltty, or disable its udev rule, then plug the engraver in again.",
+            "È installato il servizio braille \"brltty\", che scambia il convertitore USB dell'incisore (CH340) per un display braille. Rimuovi brltty, o disattiva la sua regola udev, poi ricollega l'incisore.",
+        ),
+        Problem::DriverNotBound { brltty: false } => tr(
+            "The kernel driver of its USB converter (ch341) is not loaded. Loading it needs the administrator password.",
+            "Il driver del kernel per il suo convertitore USB (ch341) non è caricato. Per caricarlo serve la password di amministratore.",
+        ),
+        Problem::NoAccess { .. } => tr(
+            "The port belongs to the administrator. A udev rule can give access to whoever is logged in at this computer; installing it needs the administrator password.",
+            "La porta appartiene all'amministratore. Una regola udev può dare l'accesso a chi ha la sessione aperta su questo computer; per installarla serve la password di amministratore.",
+        ),
+    }
+}
+
+/// Text of the button that runs the fix of a problem.
+pub fn problem_fix_label(problem: &Problem) -> &'static str {
+    match problem {
+        Problem::DriverNotBound { .. } => tr("Load the driver", "Carica il driver"),
+        Problem::NoAccess { .. } => tr("Install the access rule", "Installa la regola di accesso"),
     }
 }

@@ -9,11 +9,13 @@
 //! - [`plan`]: print modes, job splitting and time estimates; [`stroke`]: line art;
 //! - [`compose`]: the image to engrave from the options shared by the CLI and the GUI;
 //! - [`device`]: serial port detection and the engraver session;
+//! - [`doctor`]: what the system lacks for the engraver (driver, permissions) and its fix;
 //! - [`simulator`]: a virtual engraver on a pseudo-terminal (Unix).
 
 pub mod bitmap;
 pub mod compose;
 pub mod device;
+pub mod doctor;
 mod draw;
 pub mod gcode;
 pub mod i18n;

@@ -58,7 +58,10 @@ fn access_hint(source: &serialport::Error) -> &'static str {
 
 fn not_found_details(tried: &[(String, Option<String>)]) -> String {
     if tried.is_empty() {
-        return ": no CH340 serial port found. Check the USB cable, or name the port with --port".to_owned();
+        return format!(
+            ": no CH340 serial port found. Check the USB cable, or name the port with --port{}",
+            driver_hint()
+        );
     }
     let ports: Vec<String> = tried
         .iter()
@@ -68,6 +71,17 @@ fn not_found_details(tried: &[(String, Option<String>)]) -> String {
         })
         .collect();
     format!(". Check the USB cable and the 5 V power supply. Ports tried: {}", ports.join(", "))
+}
+
+/// Where the missing driver of the converter comes from, on the systems that lack it.
+fn driver_hint() -> &'static str {
+    if cfg!(windows) {
+        ". If the engraver is plugged in, Windows may lack the driver of its CH340 converter: Windows Update usually installs it, otherwise get CH341SER from https://www.wch-ic.com/downloads/CH341SER_EXE.html"
+    } else if cfg!(target_os = "linux") {
+        ". \"neje doctor\" checks the driver and the permissions"
+    } else {
+        ""
+    }
 }
 
 /// A serial port of this computer.

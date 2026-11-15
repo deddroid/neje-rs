@@ -142,7 +142,9 @@ pub fn hairline(p: &Palette) -> Color32 {
     p.text_dim.gamma_multiply(0.25)
 }
 
-/// Inter for everything, Rajdhani for titles; a system font covers the symbols neither has.
+/// Inter for everything, Rajdhani for titles, both built in. The few symbols they lack
+/// (arrows, the menu chevron) come from the fonts built into egui: nothing is read from the
+/// system.
 fn install_fonts(ctx: &egui::Context) {
     ctx.add_font(FontInsert::new(
         "Inter",
@@ -154,34 +156,6 @@ fn install_fonts(ctx: &egui::Context) {
         FontData::from_static(include_bytes!("../../assets/fonts/Rajdhani-SemiBold.ttf")),
         vec![InsertFontFamily { family: FontFamily::Name(TITLE_FAMILY.into()), priority: FontPriority::Highest }],
     ));
-    install_fallback_fonts(ctx);
-}
-
-/// System fonts that cover the symbols the bundled fonts lack (arrows, check marks, dots).
-fn install_fallback_fonts(ctx: &egui::Context) {
-    const CANDIDATES: &[&str] = &[
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-        "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
-        "C:\\Windows\\Fonts\\seguisym.ttf",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-    ];
-    for path in CANDIDATES {
-        if let Ok(bytes) = std::fs::read(path) {
-            let families = [FontFamily::Proportional, FontFamily::Name(TITLE_FAMILY.into()), FontFamily::Monospace];
-            ctx.add_font(FontInsert::new(
-                "symbols-fallback",
-                FontData::from_owned(bytes),
-                families
-                    .into_iter()
-                    .map(|family| InsertFontFamily { family, priority: FontPriority::Lowest })
-                    .collect(),
-            ));
-            return;
-        }
-    }
 }
 
 /// A group of rows: a small title above and a rounded container.
@@ -379,4 +353,22 @@ pub fn modal(name: &'static str, ctx: &egui::Context) -> egui::Modal {
         .corner_radius(CornerRadius::same(20))
         .inner_margin(egui::Margin::same(20));
     egui::Modal::new(egui::Id::unique(name)).frame(frame)
+}
+
+/// Round button with a "refresh" arrow drawn by hand: no font has to provide the symbol.
+pub fn refresh_button(ui: &mut egui::Ui) -> Response {
+    let response = ui.add(egui::Button::new("").min_size(egui::vec2(CONTROL_HEIGHT + 6.0, CONTROL_HEIGHT)));
+    if ui.is_rect_visible(response.rect) {
+        let colour = ui.style().interact(&response).fg_stroke.color;
+        let centre = response.rect.center();
+        let radius = 6.0;
+        let at = |degrees: f32| centre + radius * egui::Vec2::angled(degrees.to_radians());
+        // Three quarters of a circle, clockwise, ending in an arrow head at the top right.
+        let arc: Vec<egui::Pos2> = (0..=24).map(|i| at(30.0 + i as f32 * 11.25)).collect();
+        ui.painter().add(egui::Shape::line(arc, Stroke::new(1.6, colour)));
+        let tip = at(300.0);
+        let head = vec![tip + egui::vec2(4.5, 2.0), tip + egui::vec2(-1.5, 3.5), tip + egui::vec2(0.5, -3.5)];
+        ui.painter().add(egui::Shape::convex_polygon(head, colour, Stroke::NONE));
+    }
+    response
 }

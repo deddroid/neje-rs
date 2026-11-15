@@ -18,7 +18,7 @@ terminale.
 | Rilevamento, cancellazione, invio, avvio, avanzamento, fine lavoro | provati con l'incisore virtuale incluso |
 | Modalità di stampa (divisione in lavori, a tratto) e stime dei tempi | stessi tagli e stessi tempi dello strumento di riferimento; la divisione è stata provata su una macchina vera con quello strumento (stimati 143 s, impiegati 148 s, le parti combaciano) |
 | Una DK-8-KZ vera | **non ancora comandata da questo programma**; stretta di mano e movimenti sono stati provati su una macchina con il prototipo Python da cui deriva (vedi [docs/PROTOCOL.md](docs/PROTOCOL.md)) |
-| Windows | la compilazione dovrebbe funzionare, mai provata |
+| Windows | compilato e provato dalla CI (senza porta seriale); mai provato con un incisore |
 
 La DK-8-KZ incide 490 × 490 pixel. Il manuale dice 0,075 mm per pixel (36,75 mm); sulla
 macchina misurata qui un pixel vale 0,068–0,070 mm, quindi l'area è di circa 34 × 34 mm.
@@ -40,24 +40,61 @@ macchina misurata qui un pixel vale 0,068–0,070 mm, quindi l'area è di circa 
 
 ## Installazione
 
-Serve una toolchain Rust (1.88 o successiva). Su Arch/CachyOS non è servito altro per
-compilare; la finestra usa OpenGL e le finestre di scelta file del desktop.
+### Arch Linux (AUR)
 
 ```sh
-git clone <questo repository>
+yay -S neje        # compila dai sorgenti
+yay -S neje-bin    # binari già compilati
+```
+
+Il pacchetto installa `neje`, `neje-gui`, il lanciatore e la regola udev.
+
+### Altre distribuzioni Linux
+
+Scarica `neje-<versione>-linux-x86_64.tar.gz` dalla
+[pagina delle release](https://github.com/deddroid/neje-rs/releases/latest), estrailo ed esegui
+`./install.sh` (installa in `~/.local`, senza root). Per compilare dai sorgenti basta una
+toolchain Rust (1.88 o successiva):
+
+```sh
+git clone https://github.com/deddroid/neje-rs
 cd neje-rs
 ./install.sh            # compila e installa in ~/.local (senza root)
 ./install.sh --udev     # installa anche la regola udev (chiede la password di sudo)
 ./install.sh --uninstall
 ```
 
-Il convertitore USB-seriale dell'incisore (CH340, `1a86:7523`) è gestito dal kernel Linux:
-compare come `/dev/ttyUSB0`. Per aprirlo serve la regola udev
-([packaging/linux/70-neje.rules](packaging/linux/70-neje.rules), accesso all'utente che ha
-la sessione aperta sul computer) oppure l'appartenenza al gruppo proprietario della porta
-(`uucp` su Arch, `dialout` su Debian e Ubuntu).
-
 Senza interfaccia grafica: `cargo build --release --no-default-features`.
+
+### Windows
+
+Scarica `neje-<versione>-windows-x86_64.zip` dalla
+[pagina delle release](https://github.com/deddroid/neje-rs/releases/latest) ed estrailo:
+`neje.exe` è la riga di comando, `neje-gui.exe` la finestra. A Windows serve il driver del
+convertitore USB dell'incisore (CH340): di solito lo installa da solo Windows Update;
+altrimenti scarica `CH341SER` da [WCH](https://www.wch-ic.com/downloads/CH341SER_EXE.html).
+La versione per Windows non è stata provata su una macchina vera.
+
+### Cosa serve dal sistema
+
+Non va installato nulla accanto al programma: i font sono incorporati e su Linux il driver
+del convertitore USB dell'incisore (CH340, `1a86:7523`, modulo `ch341`) fa parte del kernel,
+quindi l'incisore compare come `/dev/ttyUSB0`.
+
+Due cose appartengono al sistema e possono mancare. La finestra mostra un banner quando ne
+trova una, con il pulsante che la sistema (chiede la password di amministratore);
+`neje doctor` fa lo stesso controllo dal terminale e `neje doctor --fix` la stessa correzione.
+
+- **Permesso di aprire la porta.** La porta appartiene a root e a un gruppo (`uucp` su Arch,
+  `dialout` su Debian e Ubuntu). La regola udev
+  [packaging/linux/70-neje.rules](packaging/linux/70-neje.rules) dà l'accesso all'utente
+  che ha la sessione aperta sul computer; i pacchetti AUR la installano.
+- **Driver non agganciato al convertitore.** Raro: il modulo non è caricato, oppure `brltty`
+  (un servizio braille che alcune distribuzioni installano di serie) ha scambiato il
+  convertitore per un display braille.
+
+Le finestre di scelta dei file sono quelle del desktop (`xdg-desktop-portal`, presente su KDE
+Plasma e GNOME); senza, trascina i file sulla finestra o passali sulla riga di comando.
 
 ## Uso
 
@@ -75,6 +112,7 @@ dall'incisore. La lingua si cambia in fondo al pannello, nel gruppo "Applicazion
 ### Terminale
 
 ```sh
+neje doctor                              # manca qualcosa su questo sistema?
 neje ports                               # elenca le porte seriali
 neje detect                              # trova l'incisore
 neje preview foto.jpg -o anteprima.png   # cosa verrebbe inciso, senza macchina
@@ -145,8 +183,8 @@ durante la cancellazione.
   può differire di qualche punto dal prototipo Python e dal programma originale (che usava
   il decodificatore di Windows). Tutto ciò che viene dopo la decodifica è identico. PNG, BMP
   e gli altri formati sono esatti.
-- Il testo è disegnato con un motore di font diverso da quello del prototipo: stessa
-  disposizione, non gli stessi pixel.
+- Il testo è disegnato con il font Inter incorporato (o con quello indicato da `--font`) e
+  con un motore di font diverso da quello del prototipo: non gli stessi pixel.
 - I PNG con un colore trasparente in modalità RGB e i PNG a 16 bit sono letti in modo
   leggermente diverso dal prototipo.
 - `move` sposta di 8 pixel a passo il punto in cui finirà l'immagine, e la macchina non ha
@@ -174,4 +212,4 @@ NEJE è un marchio del rispettivo proprietario; questo progetto non è affiliato
 
 ## Licenza
 
-Non ancora scelta: verrà definita prima della prima pubblicazione.
+[MIT](LICENSE). I font in `assets/fonts` sono sotto SIL Open Font License.

@@ -17,7 +17,7 @@ G-code drawing, send it to the engraver and run the job, from a window or from t
 | Detection, erase, upload, start, progress, end of job | tested against the built-in virtual engraver |
 | Print modes (split in jobs, line art) and time estimates | same cuts and times as the reference tool; the split was checked on a real machine with that tool (estimated 143 s, took 148 s, the parts lined up) |
 | A real DK-8-KZ | **not driven by this program yet**; handshake and movements were checked on one machine with the Python prototype it was ported from (see [docs/PROTOCOL.md](docs/PROTOCOL.md)) |
-| Windows | builds are expected to work, never tried |
+| Windows | built and tested by the CI (no serial port there); never tried with an engraver |
 
 The DK-8-KZ engraves 490 × 490 pixels. The manual says 0.075 mm per pixel (36.75 mm); on the
 machine measured here a pixel is 0.068–0.070 mm, so the area is about 34 × 34 mm.
@@ -37,26 +37,64 @@ machine measured here a pixel is 0.068–0.070 mm, so the area is about 34 × 34
   you have just plugged in it may be an old picture.
 - This program never writes the firmware of the engraver.
 
-## Install
+## Installation
 
-Requirements: a Rust toolchain (1.88 or newer). On Arch/CachyOS nothing else was needed to
-build; the window uses OpenGL and the desktop's own file dialogs.
+### Arch Linux (AUR)
 
 ```sh
-git clone <this repository>
+yay -S neje        # builds from source
+yay -S neje-bin    # prebuilt binaries
+```
+
+The package installs `neje`, `neje-gui`, the launcher and the udev rule.
+
+### Other Linux distributions
+
+Download `neje-<version>-linux-x86_64.tar.gz` from the
+[Releases page](https://github.com/deddroid/neje-rs/releases/latest), unpack it and run
+`./install.sh` (installs into `~/.local`, no root). To build from source instead you only
+need a Rust toolchain (1.88 or newer):
+
+```sh
+git clone https://github.com/deddroid/neje-rs
 cd neje-rs
 ./install.sh            # builds and installs into ~/.local (no root)
 ./install.sh --udev     # also installs the udev rule (asks for the sudo password)
 ./install.sh --uninstall
 ```
 
-The engraver's USB-serial converter (CH340, `1a86:7523`) is handled by the Linux kernel: it
-shows up as `/dev/ttyUSB0`. To open it you need either the udev rule
-([packaging/linux/70-neje.rules](packaging/linux/70-neje.rules), access for the user logged
-in at the computer) or membership of the group that owns the port (`uucp` on Arch,
-`dialout` on Debian and Ubuntu).
-
 Without the graphical interface: `cargo build --release --no-default-features`.
+
+### Windows
+
+Download `neje-<version>-windows-x86_64.zip` from the
+[Releases page](https://github.com/deddroid/neje-rs/releases/latest) and unpack it: `neje.exe`
+is the command line, `neje-gui.exe` the window. Windows needs the driver of the engraver's
+USB converter (CH340): Windows Update usually installs it by itself; otherwise get `CH341SER`
+from [WCH](https://www.wch-ic.com/downloads/CH341SER_EXE.html). The Windows build has not
+been tried on a real machine.
+
+### What it needs from the system
+
+Nothing has to be installed next to the program: its fonts are built in, and on Linux the
+driver of the engraver's USB converter (CH340, `1a86:7523`, kernel module `ch341`) is part
+of the kernel, so the engraver shows up as `/dev/ttyUSB0`.
+
+Two things belong to the system and can be missing. The window shows a banner when it finds
+one, with a button that fixes it (it asks for the administrator password); `neje doctor`
+does the same check in the terminal and `neje doctor --fix` the same fix.
+
+- **Permission to open the port.** The port belongs to root and to a group (`uucp` on Arch,
+  `dialout` on Debian and Ubuntu). The udev rule
+  [packaging/linux/70-neje.rules](packaging/linux/70-neje.rules) gives access to the user
+  logged in at the computer; the AUR packages install it.
+- **Driver not bound to the converter.** Rare: the module is not loaded, or `brltty` (a
+  braille service some distributions install by default) took the converter for a braille
+  display.
+
+The file dialogs of the window are those of the desktop (`xdg-desktop-portal`, present on
+KDE Plasma and GNOME); without it, drop the files on the window or pass them on the command
+line.
 
 ## Use
 
@@ -73,6 +111,7 @@ then start. The red trace on the preview follows the positions reported by the e
 ### Terminal
 
 ```sh
+neje doctor                              # is anything missing on this system?
 neje ports                               # list the serial ports
 neje detect                              # find the engraver
 neje preview photo.jpg -o preview.png    # what would be engraved, no machine needed
@@ -141,8 +180,8 @@ saves the image it receives and reports protocol mistakes such as data sent duri
 - JPEG files: decoders differ by one level on a few pixels, so the result can differ by a
   few dots from the Python prototype and from the original program (which used the Windows
   decoder). Everything after decoding is identical. PNG, BMP and the others are exact.
-- Text is rendered with a different font engine than the prototype: same layout, not the
-  same pixels.
+- Text is drawn with the built-in Inter font (or the one given with `--font`) and a
+  different font engine than the prototype: not the same pixels.
 - PNG files with a transparent colour key in RGB mode, and 16-bit PNG files, are read
   slightly differently from the prototype.
 - `move` shifts where the image lands by 8 pixels per step, and the machine has no limit
@@ -168,4 +207,4 @@ NEJE is a trademark of its owner; this project is not affiliated with it.
 
 ## License
 
-Not chosen yet: it will be set before the first public release.
+[MIT](LICENSE). The fonts in `assets/fonts` are under the SIL Open Font License.
