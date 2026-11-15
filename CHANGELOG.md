@@ -15,6 +15,12 @@ All notable changes to this project are documented here. The format follows
 
 - Error messages no longer repeat their cause twice.
 
+### Verified on hardware
+
+- DK-8-KZ, V10 firmware, 15/11/2026, with the 0.1.0 program: `detect`, `reset`, `upload`,
+  `box`, `center`, and `engrave --print-mode line --stroke 2` on `examples/badge.png`: three
+  jobs in a row without a restart, 133 s against 129 s estimated, all parts readable.
+
 ## [0.1.0] - 2026-11-15
 
 First release.

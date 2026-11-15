@@ -12,8 +12,10 @@ How `neje` talks to the engraver, and where each fact comes from.
 - **guess**: deduced, still to be tried.
 
 The measurements were made with the Python prototype this program was ported from and with
-scripts sending the same bytes. **The Rust program itself has not driven a real machine
-yet**; it produces the same bytes as the prototype (see `tests/parity`).
+scripts sending the same bytes; the Rust program produces the same bytes as the prototype
+(see `tests/parity`). On 15/11/2026 the Rust program itself ran on the machine: `detect`,
+`reset`, `upload`, `box`, `center`, and `engrave` in line-art mode, which sent and engraved
+three jobs one after the other without a restart in 133 s (129 s estimated).
 
 ## Physical layer
 
