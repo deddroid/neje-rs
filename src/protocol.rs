@@ -22,6 +22,10 @@ pub const BURN_MIN: u8 = 1;
 pub const BURN_MAX: u8 = 120;
 pub const BURN_DEFAULT: u8 = 30;
 
+/// Pixel pitch in millimetres measured on a DK-8-KZ (0.068–0.070, 14/11/2026). The manual
+/// says 0.075, i.e. 36.75 mm for 490 pixels; the real side is about 34 mm.
+pub const MEASURED_MM_PER_PX: f64 = 0.069;
+
 /// Size of the image sent to the V10 firmware: a complete 1-bit BMP of 512×512 pixels.
 pub const V10_PAYLOAD_LEN: usize = 32_830;
 

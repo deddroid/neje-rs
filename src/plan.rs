@@ -156,10 +156,10 @@ pub fn best_bands(image: &GrayImage, burn: u8) -> Vec<Range<u32>> {
     let mut seconds = vec![vec![0.0f64; n + 1]; n];
     for (a, row) in seconds.iter_mut().enumerate() {
         let mut band = Band::new(image.height());
-        for b in a + 1..=n {
+        for (b, seconds) in row.iter_mut().enumerate().skip(a + 1) {
             let x = start + b as u32 - 1;
             band.push_column(x, &columns[x as usize]);
-            row[b] = band.cost.seconds(burn);
+            *seconds = band.cost.seconds(burn);
         }
     }
     for b in 1..=n {
@@ -316,7 +316,7 @@ fn spans(image: &GrayImage, columns: &Range<u32>) -> Vec<Option<(u32, u32)>> {
         .map(|y| {
             let mut burnt = (columns.start..columns.end.min(image.width())).filter(|&x| burns(image, x, y));
             let first = burnt.next()?;
-            Some((first, burnt.last().unwrap_or(first)))
+            Some((first, burnt.next_back().unwrap_or(first)))
         })
         .collect()
 }

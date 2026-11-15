@@ -11,8 +11,9 @@ use image::{GrayImage, RgbImage};
 use neje::device::{self, PortInfo};
 use neje::i18n::{self, Lang, tr};
 use neje::imaging::{self, Mode};
-use neje::messages::{describe, laser_checklist};
-use neje::protocol::{BURN_MAX, BURN_MIN, Command, Direction, Event, Protocol, Version};
+use neje::messages::{describe, laser_checklist, mode_description};
+use neje::plan::{self, Plan, PrintMode};
+use neje::protocol::{BURN_MAX, BURN_MIN, Command, Direction, Event, MEASURED_MM_PER_PX, Protocol, Version};
 use neje::{gcode, text};
 
 use crate::settings::Settings;
@@ -21,6 +22,8 @@ use crate::worker::{Request, Update, Worker};
 
 const PANEL_WIDTH: f32 = 368.0;
 const LOG_LINES: usize = 200;
+/// Height of the strip with the three print modes under the preview.
+const MODE_STRIP_HEIGHT: f32 = 156.0;
 /// Positions kept for the red trace on the preview.
 const MAX_DOTS: usize = 40_000;
 const GCODE_EXTENSIONS: [&str; 5] = ["nc", "gcode", "gc", "ngc", "tap"];
@@ -32,6 +35,8 @@ pub struct Startup {
     pub port: Option<String>,
     pub protocol: Option<ProtocolChoice>,
     pub image: Option<PathBuf>,
+    pub print_mode: Option<ModeKind>,
+    pub stroke: Option<u8>,
     /// Folder for the automatic screenshots (one per theme and language), then quit.
     pub screenshots: Option<PathBuf>,
 }
@@ -71,6 +76,34 @@ impl ProtocolChoice {
     }
 }
 
+/// The print modes offered, without their parameters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum ModeKind {
+    Single,
+    Split,
+    Line,
+}
+
+impl ModeKind {
+    const ALL: [ModeKind; 3] = [ModeKind::Single, ModeKind::Split, ModeKind::Line];
+
+    fn mode(self, stroke: u8) -> PrintMode {
+        match self {
+            ModeKind::Single => PrintMode::Single,
+            ModeKind::Split => PrintMode::Split,
+            ModeKind::Line => PrintMode::Line { stroke },
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ModeKind::Single => tr("Single job", "Lavoro unico"),
+            ModeKind::Split => tr("Split", "Diviso"),
+            ModeKind::Line => tr("Line art", "A tratto"),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 enum Link {
     Disconnected,
@@ -82,6 +115,8 @@ enum Link {
 #[derive(Clone, Copy, PartialEq)]
 enum LaserAction {
     Start,
+    /// Send and engrave every job of the current plan.
+    Jobs,
     Command(Command),
 }
 
@@ -111,8 +146,17 @@ pub struct App {
     worker: Worker,
     settings: Settings,
 
+    /// The composition: what the user opened, rotated, wrote. Black = burn.
     base: GrayImage,
+    /// The current plan, as drawn in the preview.
     texture: egui::TextureHandle,
+    print_mode: ModeKind,
+    stroke: u8,
+    /// `base` prepared for each print mode, in the order of [`ModeKind::ALL`].
+    plans: [Plan; 3],
+    thumbnails: [egui::TextureHandle; 3],
+    /// Set when `base`, the burn time, the stroke or the protocol change.
+    plans_dirty: bool,
     /// The picture as opened, to convert it again when the mode changes.
     original: Option<RgbImage>,
     mode: Mode,
@@ -129,8 +173,13 @@ pub struct App {
     burn: u8,
     /// Fraction sent, while an image is going to the engraver.
     upload: Option<f32>,
-    /// True when the engraver holds the image shown in the preview.
+    /// The image being sent, and the last one the engraver received.
+    uploading: Option<GrayImage>,
+    sent: Option<GrayImage>,
+    /// True when the engraver holds the image of the current plan (a plan of one job).
     image_sent: bool,
+    /// Job in progress and number of jobs, while a sequence runs.
+    sequence: Option<(usize, usize)>,
     engraving_since: Option<Instant>,
     last_duration: Option<Duration>,
     position: Option<(i32, i32)>,
@@ -143,8 +192,13 @@ pub struct App {
     shots: Option<Screenshots>,
 }
 
-fn texture_image(base: &GrayImage) -> egui::ColorImage {
-    egui::ColorImage::from_gray([base.width() as usize, base.height() as usize], base.as_raw())
+fn plan_picture(plan: &Plan) -> egui::ColorImage {
+    let picture = plan.preview();
+    egui::ColorImage::from_rgb([picture.width() as usize, picture.height() as usize], picture.as_raw())
+}
+
+fn colour(rgb: image::Rgb<u8>) -> Color32 {
+    Color32::from_rgb(rgb.0[0], rgb.0[1], rgb.0[2])
 }
 
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
@@ -160,8 +214,15 @@ impl App {
         theme::apply(&cc.egui_ctx);
         let settings = Settings::load();
         i18n::set(settings.lang());
-        let base = imaging::new_base(Protocol::new(Version::V10, None).base_size());
-        let texture = cc.egui_ctx.load_texture("preview", texture_image(&base), egui::TextureOptions::LINEAR);
+        let protocol = Protocol::new(Version::V10, None);
+        let base = imaging::new_base(protocol.base_size());
+        let burn = settings.burn.clamp(BURN_MIN, BURN_MAX);
+        let stroke = startup.stroke.unwrap_or(1).clamp(1, plan::MAX_STROKE);
+        let plans = ModeKind::ALL.map(|kind| Plan::new(&base, kind.mode(stroke), burn, protocol));
+        let load =
+            |name: &str, plan: &Plan| cc.egui_ctx.load_texture(name, plan_picture(plan), egui::TextureOptions::LINEAR);
+        let texture = load("preview", &plans[0]);
+        let thumbnails = [load("single", &plans[0]), load("split", &plans[1]), load("line", &plans[2])];
         let (picked_tx, picked_rx) = mpsc::channel();
         let shots = startup.screenshots.map(|dir| {
             let (tx, rx) = mpsc::channel();
@@ -174,10 +235,15 @@ impl App {
         });
         let mut app = App {
             worker: Worker::spawn(cc.egui_ctx.clone()),
-            burn: settings.burn.clamp(BURN_MIN, BURN_MAX),
+            burn,
             settings,
             base,
             texture,
+            print_mode: startup.print_mode.unwrap_or(ModeKind::Single),
+            stroke,
+            plans,
+            thumbnails,
+            plans_dirty: true,
             original: None,
             mode: Mode::Bw,
             gcode_fit: true,
@@ -188,7 +254,10 @@ impl App {
             port_choice: startup.port.clone(),
             protocol_choice: startup.protocol.unwrap_or(ProtocolChoice::V10),
             upload: None,
+            uploading: None,
+            sent: None,
             image_sent: false,
+            sequence: None,
             engraving_since: None,
             last_duration: None,
             position: None,
@@ -235,10 +304,34 @@ impl App {
 
     fn set_base(&mut self, base: GrayImage) {
         self.base = base;
-        self.texture.set(texture_image(&self.base), egui::TextureOptions::LINEAR);
-        self.image_sent = false;
+        self.plans_dirty = true;
         self.dots.clear();
         self.position = None;
+    }
+
+    /// The plan of the selected print mode.
+    fn plan(&self) -> &Plan {
+        &self.plans[ModeKind::ALL.iter().position(|&k| k == self.print_mode).unwrap_or(0)]
+    }
+
+    /// Prepares the image again for the three print modes and redraws their pictures.
+    fn refresh_plans(&mut self) {
+        if !self.plans_dirty {
+            return;
+        }
+        self.plans_dirty = false;
+        let protocol = self.protocol().unwrap_or(Protocol::new(Version::V10, None));
+        self.plans = ModeKind::ALL.map(|kind| Plan::new(&self.base, kind.mode(self.stroke), self.burn, protocol));
+        for (thumbnail, plan) in self.thumbnails.iter_mut().zip(&self.plans) {
+            thumbnail.set(plan_picture(plan), egui::TextureOptions::LINEAR);
+        }
+        self.texture.set(plan_picture(self.plan()), egui::TextureOptions::LINEAR);
+        self.update_image_sent();
+    }
+
+    fn update_image_sent(&mut self) {
+        let plan = self.plan();
+        self.image_sent = plan.jobs.len() == 1 && self.sent.as_ref() == Some(&plan.jobs[0].image);
     }
 
     /// The work area of the connected engraver differs from the preview: start again.
@@ -342,6 +435,7 @@ impl App {
                         protocol.version
                     ));
                     self.link = Link::Connected { port, protocol };
+                    self.plans_dirty = true;
                     self.resize_base(protocol.base_size());
                 }
                 Update::Disconnected => {
@@ -350,7 +444,9 @@ impl App {
                     }
                     self.link = Link::Disconnected;
                     self.upload = None;
-                    self.image_sent = false;
+                    self.sent = None;
+                    self.sequence = None;
+                    self.plans_dirty = true;
                     self.stop_clock();
                 }
                 Update::Event(event) => self.on_event(event),
@@ -358,7 +454,10 @@ impl App {
                 Update::Started => {
                     self.engraving_since = Some(Instant::now());
                     self.last_duration = None;
-                    self.dots.clear();
+                    // The trace of the previous jobs of a sequence stays on the preview.
+                    if self.sequence.is_none_or(|(index, _)| index == 1) {
+                        self.dots.clear();
+                    }
                     self.log(format!(
                         "{} {}",
                         tr("Engraving started, burn time", "Incisione avviata, tempo di bruciatura"),
@@ -368,11 +467,38 @@ impl App {
                 Update::UploadProgress { sent, total } => self.upload = Some(sent as f32 / total.max(1) as f32),
                 Update::UploadDone => {
                     self.upload = None;
-                    self.image_sent = true;
+                    self.sent = self.uploading.take();
+                    self.update_image_sent();
                     self.log(tr("Image sent to the engraver", "Immagine inviata all'incisore"));
+                }
+                Update::Job { index, total } => {
+                    self.sequence = Some((index, total));
+                    self.upload = Some(0.0);
+                    self.sent = None;
+                    self.update_image_sent();
+                    self.log(format!(
+                        "{} {index}/{total}: {}",
+                        tr("Job", "Lavoro"),
+                        tr("erasing the memory...", "cancellazione della memoria...")
+                    ));
+                }
+                Update::JobsDone => {
+                    self.sequence = None;
+                    self.log(tr("All the jobs are finished", "Tutti i lavori sono terminati"));
+                }
+                Update::Restarted => {
+                    self.sequence = None;
+                    self.upload = None;
+                    self.stop_clock();
+                    self.log_error(tr(
+                        "the engraver restarted during the job, which is incomplete. Power it from a 5 V supply, not from the USB ports of the computer",
+                        "l'incisore si è riavviato durante il lavoro, che è incompleto. Alimentalo con un alimentatore 5 V, non dalle porte USB del computer",
+                    ));
                 }
                 Update::Error(error) => {
                     self.upload = None;
+                    self.uploading = None;
+                    self.sequence = None;
                     if self.link == Link::Connecting {
                         self.link = Link::Disconnected;
                     }
@@ -435,6 +561,7 @@ impl App {
 
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         let connecting = self.link == Link::Connecting;
+        let laser = if self.plan().jobs.len() > 1 { LaserAction::Jobs } else { LaserAction::Start };
         let Some(s) = self.shots.as_mut() else { return };
         ctx.request_repaint();
         if connecting {
@@ -458,7 +585,7 @@ impl App {
         };
         ctx.set_theme(theme);
         i18n::set(lang);
-        self.confirm = dialog.then_some(LaserAction::Start);
+        self.confirm = dialog.then_some(laser);
         s.frames += 1;
         if s.frames >= 5 && !s.requested {
             s.requested = true;
@@ -489,10 +616,10 @@ impl App {
         });
         ui.add_space(4.0);
 
-        let log_height = 118.0;
-        let status_height = 30.0;
+        let log_height = 84.0;
+        let status_height = 56.0;
         let available = ui.available_size();
-        let side = available.x.min(available.y - log_height - status_height - 16.0).max(160.0);
+        let side = available.x.min(available.y - log_height - status_height - MODE_STRIP_HEIGHT - 28.0).max(160.0);
         ui.vertical_centered(|ui| {
             // The work area sits straight on the window, outlined so that white stays visible.
             let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
@@ -515,11 +642,12 @@ impl App {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            let mm = f64::from(self.base_size()) * gcode::MM_PER_PX;
-            let burn = imaging::black_ratio(&self.base) * 100.0;
+            let mm = f64::from(self.base_size()) * MEASURED_MM_PER_PX;
+            let burn = imaging::black_ratio(&self.plan().image) * 100.0;
             ui.label(theme::dim(format!(
-                "{0}×{0} px   {mm:.2}×{mm:.2} mm   {burn:.1}% {1}",
+                "{0}×{0} px   {1} {mm:.0}×{mm:.0} mm   {burn:.1}% {2}",
                 self.base_size(),
+                tr("about", "circa"),
                 tr("to burn", "da bruciare")
             )));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -533,7 +661,123 @@ impl App {
                 }
             });
         });
+        self.estimate_line(ui);
+        self.mode_strip(ui);
         self.log_view(ui, log_height);
+    }
+
+    /// The three print modes as pictures of the current image with their estimated time,
+    /// and what the selected one does.
+    fn mode_strip(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        let frame = egui::Frame::new()
+            .fill(p.surface)
+            .corner_radius(CornerRadius::same(16))
+            .inner_margin(egui::Margin::same(4));
+        frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_height(MODE_STRIP_HEIGHT - 8.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let card = egui::vec2(MODE_STRIP_HEIGHT - 8.0 - 38.0, MODE_STRIP_HEIGHT - 8.0);
+                for (i, kind) in ModeKind::ALL.into_iter().enumerate() {
+                    let (rect, response) = ui.allocate_exact_size(card, egui::Sense::click());
+                    let selected = kind == self.print_mode;
+                    let radius = CornerRadius::same(12);
+                    let fill = if selected {
+                        p.bg
+                    } else if response.hovered() {
+                        p.track.gamma_multiply(0.5)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(rect, radius, fill);
+                    if selected {
+                        ui.painter().rect_stroke(rect, radius, Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+                    }
+                    let side = card.x - 12.0;
+                    let picture = egui::Rect::from_min_size(rect.min + egui::vec2(6.0, 6.0), egui::vec2(side, side));
+                    egui::Image::new(&self.thumbnails[i]).corner_radius(CornerRadius::same(8)).paint_at(ui, picture);
+                    ui.painter().rect_stroke(
+                        picture,
+                        CornerRadius::same(8),
+                        Stroke::new(1.0, theme::hairline(p)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let plan = &self.plans[i];
+                    let name_pos = egui::pos2(rect.center().x, picture.bottom() + 5.0);
+                    let name_font = egui::FontId::proportional(12.5);
+                    ui.painter().text(name_pos, egui::Align2::CENTER_TOP, kind.label(), name_font, p.text);
+                    let time = if plan.is_empty() { "–:––".to_owned() } else { plan::clock(plan.seconds) };
+                    ui.painter().text(
+                        name_pos + egui::vec2(0.0, 16.0),
+                        egui::Align2::CENTER_TOP,
+                        time,
+                        egui::FontId::monospace(12.5),
+                        if selected { p.accent } else { p.text_dim },
+                    );
+                    let response = response.on_hover_text(mode_description(kind.mode(self.stroke)));
+                    if response.clicked() && !selected {
+                        self.print_mode = kind;
+                        self.plans_dirty = true;
+                    }
+                }
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width() - 8.0);
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(tr("Print mode", "Modalità di stampa")).color(p.text_dim).size(12.5));
+                    ui.add(egui::Label::new(RichText::new(mode_description(self.plan().mode)).size(12.5)).wrap());
+                    if self.print_mode == ModeKind::Line {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr("Stroke (pixels)", "Tratto (pixel)")).size(12.5));
+                            if theme::slider(ui, &mut self.stroke, 1, plan::MAX_STROKE, 110.0).changed() {
+                                self.plans_dirty = true;
+                            }
+                        });
+                    }
+                });
+            });
+        });
+        ui.add_space(6.0);
+    }
+
+    /// Estimated time of the current plan next to the single job, and the key of the colours.
+    fn estimate_line(&self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        let plan = self.plan();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if plan.is_empty() {
+                ui.label(theme::dim(tr("Nothing to burn yet", "Ancora niente da bruciare")));
+                return;
+            }
+            ui.label(RichText::new(tr("Estimated time", "Tempo stimato")).small().color(p.text_dim));
+            ui.label(RichText::new(plan::clock(plan.seconds)).monospace());
+            if plan.jobs.len() > 1 {
+                ui.label(theme::dim(format!("{} {} {}", tr("in", "in"), plan.jobs.len(), tr("jobs", "lavori"))));
+            }
+            if plan.mode != PrintMode::Single {
+                ui.label(theme::dim(format!(
+                    "{} {}",
+                    tr("single job", "lavoro unico"),
+                    plan::clock(plan.single_seconds)
+                )));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut key = |colour: Color32, text: &str| {
+                    ui.label(theme::dim(text));
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, colour);
+                    ui.add_space(6.0);
+                };
+                if plan.jobs.len() > 1 {
+                    key(colour(plan::CUT), tr("cut between jobs", "taglio fra i lavori"));
+                    key(colour(plan::SAVED), tr("no longer crossed", "non più attraversato"));
+                }
+                key(colour(plan::TRAVEL), tr("crossed empty", "attraversato a vuoto"));
+            });
+        });
     }
 
     /// The positions reported by the engraver, and the head, over the preview.
@@ -728,15 +972,36 @@ impl App {
             theme::row(ui, tr("Burn time", "Tempo di bruciatura"), |ui| {
                 let width = (ui.available_width() - 68.0).clamp(60.0, 170.0);
                 let response = theme::slider(ui, &mut self.burn, BURN_MIN, BURN_MAX, width);
+                if response.changed() {
+                    self.plans_dirty = true; // the estimates and the best cuts depend on it
+                }
                 // Like the original: the engraver gets the value when the slider is released.
                 if (response.drag_stopped() || (response.changed() && !response.dragged())) && connected {
                     self.worker.request(Request::Send(Command::SetBurn(self.burn)));
                 }
             });
-            theme::row(ui, "", |ui| {
+            let jobs = self.plan().jobs.len();
+            let empty = self.plan().is_empty();
+            let sequence = self.sequence;
+            let sequence_label = sequence.map(|(index, total)| format!("{} {index}/{total}", tr("Job", "Lavoro")));
+            theme::row(ui, sequence_label.as_deref().unwrap_or(""), |ui| {
                 let width = ui.available_width() - 8.0;
                 if let Some(fraction) = self.upload {
                     ui.add(egui::ProgressBar::new(fraction).desired_width(width).show_percentage());
+                    return;
+                }
+                if sequence.is_some() {
+                    ui.label(theme::dim(tr("engraving", "incisione in corso")));
+                    return;
+                }
+                let nothing = tr("Open a picture first", "Prima apri un'immagine");
+                if jobs > 1 {
+                    // One button for the whole sequence: upload, engrave, next job.
+                    let label = format!("{} {jobs} {}", tr("Engrave in", "Incidi in"), tr("jobs", "lavori"));
+                    let button = theme::primary(ui, &label).min_size(egui::vec2(width, theme::CONTROL_HEIGHT));
+                    if ui.add_enabled(idle, button).on_disabled_hover_text(need).clicked() {
+                        self.confirm = Some(LaserAction::Jobs);
+                    }
                     return;
                 }
                 let label = if self.image_sent {
@@ -746,11 +1011,14 @@ impl App {
                 };
                 // The next step of the job is the one accent button of the window.
                 let button = if self.image_sent { egui::Button::new(label) } else { theme::primary(ui, label) };
-                let response = ui.add_enabled(idle, button.min_size(egui::vec2(width, theme::CONTROL_HEIGHT)));
-                if response.on_disabled_hover_text(need).clicked() {
+                let response =
+                    ui.add_enabled(idle && !empty, button.min_size(egui::vec2(width, theme::CONTROL_HEIGHT)));
+                if response.on_disabled_hover_text(if connected { nothing } else { need }).clicked() {
+                    let image = self.plan().jobs[0].image.clone();
                     self.upload = Some(0.0);
+                    self.uploading = Some(image.clone());
                     self.log(tr("Erasing the memory...", "Cancellazione della memoria..."));
-                    self.worker.request(Request::Upload(self.base.clone()));
+                    self.worker.request(Request::Upload(image));
                 }
             });
             theme::row(ui, "", |ui| {
@@ -808,30 +1076,49 @@ impl App {
         let need = tr("Connect the engraver first", "Prima collega l'incisore");
         let can = |command: Command| protocol.is_some_and(|p| p.encode(command).is_ok());
         let tip = |text: &'static str| if protocol.is_some() { text } else { need };
-        theme::group(ui, tr("Head", "Testa"), |ui| {
+        // The arrows move the reference of the image, not just the head: measured on the V10.
+        theme::group(ui, tr("Position of the image", "Posizione dell'immagine"), |ui| {
             let arrows = [
-                ("◀", idle, tip(tr("Left", "Sinistra"))),
-                ("▲", idle, tip(tr("Up", "Su"))),
-                ("▼", idle, tip(tr("Down", "Giù"))),
-                ("▶", idle, tip(tr("Right", "Destra"))),
+                ("◀", idle, tip(tr("Shift the image 8 pixels to the left", "Sposta l'immagine di 8 pixel a sinistra"))),
+                (
+                    "▲",
+                    idle,
+                    tip(tr("Shift the image 8 pixels away from you", "Sposta l'immagine di 8 pixel verso il fondo")),
+                ),
+                (
+                    "▼",
+                    idle,
+                    tip(tr(
+                        "Shift the image 8 pixels towards you (on the DK-8-KZ this step often stalls)",
+                        "Sposta l'immagine di 8 pixel verso di te (sulla DK-8-KZ questo passo spesso si blocca)",
+                    )),
+                ),
+                ("▶", idle, tip(tr("Shift the image 8 pixels to the right", "Sposta l'immagine di 8 pixel a destra"))),
             ];
             let directions = [Direction::Left, Direction::Up, Direction::Down, Direction::Right];
             if let Some(i) = theme::button_row(ui, &arrows) {
                 self.send(Command::Move(directions[i]));
             }
             let places = [
-                (tr("Centre", "Centro"), idle, tip(tr("Go to the centre", "Vai al centro"))),
+                (
+                    tr("Centre", "Centro"),
+                    idle,
+                    tip(tr(
+                        "Go to the centre of the image in memory (also stops the outline)",
+                        "Vai al centro dell'immagine in memoria (ferma anche il riquadro)",
+                    )),
+                ),
                 (
                     tr("Origin", "Origine"),
                     idle && can(Command::Home),
-                    tip(tr("Go to the origin (V10)", "Vai all'origine (V10)")),
+                    tip(tr("Go to the origin of the work area (V10)", "Vai all'origine dell'area di lavoro (V10)")),
                 ),
                 (
                     tr("Outline", "Riquadro"),
                     idle,
                     tip(tr(
-                        "Trace the outline of the image (laser on)",
-                        "Traccia il contorno dell'immagine (laser acceso)",
+                        "Trace the outline of the image over and over, laser on, until you press Centre",
+                        "Traccia il contorno dell'immagine a ripetizione, laser acceso, finché non premi Centro",
                     )),
                 ),
             ];
@@ -884,6 +1171,10 @@ impl App {
                     "No image was sent in this session: the engraver will burn whatever is left in its memory, at full power.",
                     "In questa sessione non è stata inviata nessuna immagine: l'incisore brucerà quella rimasta nella sua memoria, a piena potenza.",
                 ),
+                LaserAction::Jobs => tr(
+                    "The image will be sent and engraved in several jobs, one after the other, at full power. Do not restart or switch off the engraver until the last one has finished, or the parts will not line up.",
+                    "L'immagine verrà inviata e incisa in più lavori, uno dopo l'altro, a piena potenza. Non riavviare né spegnere l'incisore finché l'ultimo non è finito, altrimenti le parti non combaciano.",
+                ),
                 LaserAction::Command(_) => tr("This command moves the head with the laser on.", "Questo comando muove la testa con il laser acceso."),
             });
             ui.add_space(4.0);
@@ -893,7 +1184,7 @@ impl App {
             ui.add_space(8.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let go = match action {
-                    LaserAction::Start => tr("Start engraving", "Avvia l'incisione"),
+                    LaserAction::Start | LaserAction::Jobs => tr("Start engraving", "Avvia l'incisione"),
                     LaserAction::Command(_) => tr("Switch the laser on", "Accendi il laser"),
                 };
                 if ui.add(theme::primary(ui, go)).clicked() {
@@ -912,6 +1203,13 @@ impl App {
                         self.settings.burn = self.burn;
                         self.save_settings();
                         self.worker.request(Request::Start(self.burn));
+                    }
+                    LaserAction::Jobs => {
+                        self.settings.burn = self.burn;
+                        self.save_settings();
+                        let images: Vec<GrayImage> = self.plan().jobs.iter().map(|job| job.image.clone()).collect();
+                        self.sequence = Some((1, images.len()));
+                        self.worker.request(Request::RunJobs { images, burn: self.burn });
                     }
                     LaserAction::Command(command) => self.worker.request(Request::Send(command)),
                 }
@@ -963,6 +1261,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_worker();
         self.poll_files(&ctx);
+        self.refresh_plans();
         self.screenshot_step(&ctx);
         let p = palette(ui);
         egui::Panel::right("controls")

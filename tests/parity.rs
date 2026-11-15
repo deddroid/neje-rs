@@ -5,7 +5,8 @@
 //!
 //! ```sh
 //! python tests/parity/reference.py --prototype ../neje-linux --out /tmp/parity \
-//!     --clipart ../Image --samples "../Neje - 3.6/pic sample 490x490px"
+//!     --clipart ../Image --samples "../Neje - 3.6/pic sample 490x490px" \
+//!     --optimizer ../strumenti/ottimizza_lavori.py
 //! NEJE_PARITY_DIR=/tmp/parity cargo test --test parity -- --ignored --nocapture
 //! ```
 
@@ -180,6 +181,18 @@ fn actual(f: &[&str]) -> String {
                 start = cut;
             }
             events.iter().map(event_text).collect::<Vec<_>>().join(";")
+        }
+        "bands" => {
+            // Same reading as the reference tool: black is anything darker than mid grey.
+            let mut image = image::open(f[1]).unwrap().into_luma8();
+            image.pixels_mut().for_each(|p| p.0[0] = if p.0[0] < 128 { 0 } else { 255 });
+            let burn: u8 = f[2].parse().unwrap();
+            let bands = neje::plan::best_bands(&image, burn);
+            let single = neje::plan::cost(&image, 0..image.width()).seconds(burn);
+            let total: f64 = bands.iter().map(|b| neje::plan::cost(&image, b.clone()).seconds(burn)).sum();
+            assert_eq!(single, float_from_hex(f[3]), "single job seconds of {}", f[1]);
+            assert_eq!(total, float_from_hex(f[4]), "total seconds of {} at burn {burn}", f[1]);
+            bands.iter().map(|b| format!("{}-{}", b.start, b.end)).collect::<Vec<_>>().join(",")
         }
         "recognise" => {
             let version: Version = f[1].parse().unwrap();

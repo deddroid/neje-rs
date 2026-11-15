@@ -15,3 +15,8 @@ All notable changes to this project are documented here. The format follows
   pseudo-terminal.
 - `neje` command line and `neje-gui` window (egui), in English and Italian.
 - udev rule (`uaccess`), desktop launcher and `install.sh` for a per-user installation.
+- Print modes, from measurements on a real DK-8-KZ: single job, split in vertical bands
+  engraved one after the other, and line art with a stroke of 1 to 6 pixels. Each comes with
+  a description, a picture of the plan (travel crossed and saved, cuts) and a time estimate,
+  in `neje preview` and in the window.
+- A restart of the board during a job (`79`) is reported as an error.

@@ -7,7 +7,12 @@ inputs and writes `manifest.tsv`: one line per case with the inputs and the SHA-
 expected output. The Rust test recomputes every case and compares.
 
     python reference.py --prototype ~/Code/Neje/neje-linux --out /tmp/parity \
-        [--clipart DIR] [--samples DIR] [--limit N] [--jobs N]
+        [--clipart DIR] [--samples DIR] [--limit N] [--jobs N] \
+        [--optimizer ottimizza_lavori.py] [--drawings DIR]
+
+`--optimizer` adds the print-mode cases: the bands chosen by the reference tool
+`ottimizza_lavori.py` (needs numpy) and its time estimates, on synthetic drawings and on the
+490x490 PNG files of `--drawings`.
 
 Needs Pillow (the prototype's dependency). Nothing from NEJE is copied into the repository:
 the image folders are only read, and only their paths and hashes end up in the manifest.
@@ -183,9 +188,66 @@ def case_decode(path):
     return f"decode\t{path}\t{im.width}\t{im.height}\t{sha(im.tobytes())}"
 
 
+def make_drawings(out: Path, rng: random.Random) -> list[Path]:
+    """Black and white 490x490 drawings with parts far apart, close together, or alone."""
+    folder = out / "drawings"
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for i in range(10):
+        im = Image.new("L", (490, 490), 255)
+        draw = ImageDraw.Draw(im)
+        for _ in range(rng.randrange(1, 6)):
+            x0, y0 = rng.randrange(0, 440), rng.randrange(0, 440)
+            w, h = rng.randrange(1, 120), rng.randrange(1, 200)
+            if rng.random() < 0.4:
+                draw.ellipse((x0, y0, x0 + w, y0 + h), outline=0, width=rng.randrange(1, 9))
+            elif rng.random() < 0.5:
+                draw.rectangle((x0, y0, x0 + w, y0 + h), fill=0)
+            else:
+                draw.line((x0, y0, x0 + w, y0 + h), fill=0, width=rng.randrange(1, 6))
+        path = folder / f"drawing-{i:02d}.png"
+        im.save(path)
+        paths.append(path)
+    Image.new("L", (490, 490), 255).save(folder / "empty.png")
+    return paths + [folder / "empty.png"]
+
+
+_optimizer = None
+
+
+def use_optimizer(path: str) -> None:
+    """Loads the reference tool as a module (also in the worker processes)."""
+    import importlib.util
+    global _optimizer
+    spec = importlib.util.spec_from_file_location("ottimizza_lavori", path)
+    _optimizer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_optimizer)
+
+
+def case_bands(args):
+    import numpy as np
+    path, burn = args
+    black = np.asarray(Image.open(path).convert("L")) < 128
+    bands = _optimizer.tagli_migliori(black, burn)
+    total = 0.0
+    for a, b in bands:
+        job = np.zeros_like(black)
+        job[:, a:b] = black[:, a:b]
+        total += _optimizer.secondi(job, burn)
+    single = _optimizer.secondi(black, burn)
+    text = ",".join(f"{a}-{b}" for a, b in bands)
+    return f"bands\t{path}\t{burn}\t{float(single).hex()}\t{float(total).hex()}\t{text}"
+
+
 def run(case):
     fn, args = case
     return fn(args)
+
+
+def prepare_worker(prototype: str, optimizer: str | None) -> None:
+    use_prototype(prototype)
+    if optimizer:
+        use_optimizer(optimizer)
 
 
 def use_prototype(folder: str) -> None:
@@ -286,6 +348,8 @@ def main() -> int:
     ap.add_argument("--samples", help="folder of the NEJE sample pictures (JPEG)")
     ap.add_argument("--limit", type=int, help="use at most N clipart files")
     ap.add_argument("--jobs", type=int, default=os.cpu_count())
+    ap.add_argument("--optimizer", help="path of ottimizza_lavori.py, the reference for the print modes")
+    ap.add_argument("--drawings", help="folder of 490x490 black and white PNG files to split in jobs")
     a = ap.parse_args()
 
     prototype = str(Path(a.prototype).expanduser().resolve())
@@ -327,8 +391,15 @@ def main() -> int:
         cases.append((case_segments, str(p)))
         cases += [(case_gcode, (str(p), size, fit, line)) for size in (490, 550) for fit in (0, 1) for line in (1, 2, 3, 5)]
 
+    optimizer = str(Path(a.optimizer).expanduser().resolve()) if a.optimizer else None
+    if optimizer:
+        drawings = make_drawings(out, rng)
+        if a.drawings:
+            drawings += [p for p in sorted(Path(a.drawings).expanduser().glob("*.png")) if Image.open(p).size == (490, 490)]
+        cases += [(case_bands, (str(p), burn)) for p in drawings for burn in (10, 40, 120)]
+
     lines = list(command_lines()) + list(parse_lines(rng)) + list(recognise_lines(rng)) + list(hypot_lines(rng))
-    with Pool(a.jobs, initializer=use_prototype, initargs=(prototype,)) as pool:
+    with Pool(a.jobs, initializer=prepare_worker, initargs=(prototype, optimizer)) as pool:
         for n, line in enumerate(pool.imap_unordered(run, cases, chunksize=8), 1):
             lines.append(line)
             if n % 500 == 0:

@@ -245,13 +245,15 @@ enum Cmd {
     Start(RunArgs),
     /// Pause the engraving. With --port it is sent even if the engraver does not answer
     Pause,
-    /// Restart the engraver (Reboot). With --port it is sent even if the engraver does not answer
+    /// Restart the engraver (Reboot): it finds its edges again, so the position is lost.
+    /// With --port it is sent even if the engraver does not answer
     Reset,
-    /// Go to the origin (V10)
+    /// Go to the origin of the work area (V10). Ignored after a finished job, until "reset"
     Home,
-    /// Go to the centre
+    /// Go to the centre of the image in memory; also stops "box". Ignored after a finished
+    /// job, until "reset"
     Center,
-    /// Trace the outline of the image. SWITCHES THE LASER ON
+    /// Trace the outline of the image over and over, until "center". SWITCHES THE LASER ON
     Box(LaserArgs),
     /// Skip forward in the engraving. SWITCHES THE LASER ON
     Forward(LaserArgs),
@@ -263,7 +265,8 @@ enum Cmd {
     PowerOn,
     /// Power off (V2x/V30)
     PowerOff,
-    /// Move the head (this also moves where the image will be engraved)
+    /// Shift where the image will be engraved, 8 pixels per step (on the DK-8-KZ "down"
+    /// often stalls)
     Move {
         #[arg(value_enum)]
         direction: DirectionArg,

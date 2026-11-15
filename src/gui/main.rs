@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use eframe::egui;
 
-use app::{App, ProtocolChoice, Startup};
+use app::{App, ModeKind, ProtocolChoice, Startup};
 
 #[derive(Parser)]
 #[command(name = "neje-gui", version, about = "Graphical interface for NEJE DK-8-KZ laser engravers")]
@@ -22,6 +22,12 @@ struct Args {
     /// Protocol of the engraver (default: V10)
     #[arg(long, value_enum, ignore_case = true)]
     protocol: Option<ProtocolChoice>,
+    /// Print mode selected at start-up (default: single)
+    #[arg(long, value_enum)]
+    print_mode: Option<ModeKind>,
+    /// Stroke width of the line mode, in pixels
+    #[arg(long)]
+    stroke: Option<u8>,
     /// Picture or G-code file to open
     file: Option<PathBuf>,
 }
@@ -37,13 +43,15 @@ fn main() -> eframe::Result {
         port: args.port,
         protocol: args.protocol,
         image: args.file,
+        print_mode: args.print_mode,
+        stroke: args.stroke,
         // NEJE_GUI_SCREENSHOTS=<folder>: save one screenshot per theme and language, then quit.
         screenshots: std::env::var_os("NEJE_GUI_SCREENSHOTS").map(PathBuf::from),
     };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("NEJE")
         .with_app_id("neje")
-        .with_inner_size([1080.0, 880.0])
+        .with_inner_size([1100.0, 950.0])
         .with_min_inner_size([860.0, 620.0]);
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
