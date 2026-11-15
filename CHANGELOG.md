@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `neje preview drawing.nc` (and `upload`, `engrave`) treats a G-code file given in place
+  of the picture as a drawing, like the window does.
+
+### Fixed
+
+- Error messages no longer repeat their cause twice.
+
+### Verified on hardware
+
+- DK-8-KZ, V10 firmware, 15/11/2026, with the 0.1.0 program: `detect`, `reset`, `upload`,
+  `box`, `center`, and `engrave --print-mode line --stroke 2` on `examples/badge.png`: three
+  jobs in a row without a restart, 133 s against 129 s estimated, all parts readable; and
+  `engrave --print-mode split --burn 30` on the same picture, with a cut across a filled
+  ring: 441 s against 439 s estimated.
+
 ## [0.1.0] - 2026-11-15
 
 First release.

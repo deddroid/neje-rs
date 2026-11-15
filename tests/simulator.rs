@@ -259,3 +259,23 @@ fn preview_compares_the_print_modes() {
     assert!(plan.exists());
     assert_eq!(image::open(format!("{}-2.png", prefix.display())).unwrap().into_luma8().dimensions(), (490, 490));
 }
+
+#[test]
+fn gcode_file_in_place_of_the_picture_and_clear_errors() {
+    let output = temp_file("rosette-out.png");
+    let run = |file: &str| {
+        Process::new(env!("CARGO_BIN_EXE_neje"))
+            .args(["--lang", "en", "preview", file, "--fit", "-o", output.to_str().unwrap()])
+            .output()
+            .unwrap()
+    };
+    let out = run(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/rosette.nc"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let drawing = image::open(&output).unwrap().into_luma8();
+    assert!(drawing.pixels().any(|p| p.0[0] == 0), "the G-code drawing is empty");
+
+    let out = run("no-such-picture.png");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("No such file").count(), 1, "the cause is repeated: {stderr}");
+}

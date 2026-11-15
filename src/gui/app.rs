@@ -27,7 +27,6 @@ const LOG_LINES: usize = 200;
 const MODE_STRIP_HEIGHT: f32 = 156.0;
 /// Positions kept for the red trace on the preview.
 const MAX_DOTS: usize = 40_000;
-const GCODE_EXTENSIONS: [&str; 5] = ["nc", "gcode", "gc", "ngc", "tap"];
 const IMAGE_EXTENSIONS: [&str; 8] = ["jpg", "jpeg", "png", "bmp", "gif", "tif", "tiff", "webp"];
 
 /// What the window was asked to do at start-up.
@@ -253,10 +252,6 @@ fn plan_picture(plan: &Plan) -> egui::ColorImage {
 
 fn colour(rgb: image::Rgb<u8>) -> Color32 {
     Color32::from_rgb(rgb.0[0], rgb.0[1], rgb.0[2])
-}
-
-fn has_extension(path: &Path, extensions: &[&str]) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| extensions.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
 fn file_name(path: &Path) -> String {
@@ -500,7 +495,7 @@ impl App {
     }
 
     fn open_path(&mut self, path: &Path) {
-        if has_extension(path, &GCODE_EXTENSIONS) {
+        if gcode::is_gcode_path(path) {
             self.open_gcode(path);
         } else {
             self.open_image(path);
@@ -1101,7 +1096,7 @@ impl App {
                     rfd::FileDialog::new().add_filter(tr("Pictures", "Immagini"), &IMAGE_EXTENSIONS).pick_file()
                 }),
                 Some(_) => self.pick(&ctx, Picked::Gcode, || {
-                    rfd::FileDialog::new().add_filter("G-code", &GCODE_EXTENSIONS).pick_file()
+                    rfd::FileDialog::new().add_filter("G-code", &gcode::EXTENSIONS).pick_file()
                 }),
                 None => {}
             }
