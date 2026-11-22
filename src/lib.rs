@@ -4,6 +4,7 @@
 //! - [`protocol`]: commands, incoming messages and the image payload of protocols
 //!   V10/V20/V21/V30;
 //! - [`imaging`]: shrink to the work area, grey, Otsu, NEJE dithering, canvas operations;
+//! - [`scale`]: scaling the content of the work area to a size;
 //! - [`gcode`]: G-code to bitmap;
 //! - [`text`]: text to bitmap;
 //! - [`plan`]: print modes, job splitting and time estimates; [`stroke`]: line art;
@@ -24,6 +25,7 @@ pub mod messages;
 pub mod plan;
 pub mod protocol;
 mod resample;
+pub mod scale;
 #[cfg(unix)]
 pub mod simulator;
 pub mod stroke;
