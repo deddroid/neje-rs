@@ -7,6 +7,7 @@
 //! - [`scale`]: scaling the content of the work area to a size;
 //! - [`gcode`]: G-code to bitmap;
 //! - [`text`]: text to bitmap;
+//! - [`fonts`]: the fonts installed on the system, by name;
 //! - [`plan`]: print modes, job splitting and time estimates; [`stroke`]: line art;
 //! - [`compose`]: the image to engrave from the options shared by the CLI and the GUI;
 //! - [`device`]: serial port detection and the engraver session;
@@ -18,6 +19,7 @@ pub mod compose;
 pub mod device;
 pub mod doctor;
 mod draw;
+pub mod fonts;
 pub mod gcode;
 pub mod i18n;
 pub mod imaging;

@@ -18,6 +18,22 @@ const BORDER: i32 = 2;
 /// every system without looking for installed fonts.
 const BUILT_IN_FONT: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
 
+/// Largest em size accepted by [`size_for_height`].
+pub const MAX_SIZE: u32 = 1000;
+
+/// Largest area of a rendered text, in pixels.
+const MAX_AREA: i64 = 64_000_000;
+
+/// Where the font of a text comes from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FontSource {
+    /// Inter, built into the program.
+    #[default]
+    BuiltIn,
+    /// Face `index` of a font file (0 unless the file is a collection).
+    File { path: PathBuf, index: u32 },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TextError {
     #[error("font \"{0}\" not found: pass the path of a .ttf or .otf file")]
@@ -26,7 +42,7 @@ pub enum TextError {
     BadFont { path: String, reason: String },
 }
 
-fn font_dirs() -> Vec<PathBuf> {
+pub(crate) fn font_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![
         PathBuf::from("/usr/share/fonts"),
         PathBuf::from("/usr/local/share/fonts"),
@@ -69,26 +85,39 @@ pub fn find_font(name: &str) -> Result<PathBuf, TextError> {
     font_dirs().iter().find_map(|dir| find_in(dir, name, 4)).ok_or_else(|| TextError::FontNotFound(name.to_owned()))
 }
 
-/// The font to draw with: the file called `name`, or the built-in one.
-fn load_font(name: Option<&str>) -> Result<FontVec, TextError> {
-    let (bytes, origin) = match name {
-        Some(name) => {
-            let path = find_font(name)?;
+/// Loads the font of `source`.
+pub fn load(source: &FontSource) -> Result<FontVec, TextError> {
+    match source {
+        FontSource::BuiltIn => FontVec::try_from_vec(BUILT_IN_FONT.to_vec())
+            .map_err(|e| TextError::BadFont { path: "built-in".to_owned(), reason: e.to_string() }),
+        FontSource::File { path, index } => {
             let origin = path.display().to_string();
             let bytes =
-                std::fs::read(&path).map_err(|e| TextError::BadFont { path: origin.clone(), reason: e.to_string() })?;
-            (bytes, origin)
+                std::fs::read(path).map_err(|e| TextError::BadFont { path: origin.clone(), reason: e.to_string() })?;
+            FontVec::try_from_vec_and_index(bytes, *index)
+                .map_err(|e| TextError::BadFont { path: origin, reason: e.to_string() })
         }
-        None => (BUILT_IN_FONT.to_vec(), "built-in".to_owned()),
+    }
+}
+
+/// The font to draw with: the file called `name`, or the built-in one.
+fn load_font(name: Option<&str>) -> Result<FontVec, TextError> {
+    let source = match name {
+        Some(name) => FontSource::File { path: find_font(name)?, index: 0 },
+        None => FontSource::BuiltIn,
     };
-    FontVec::try_from_vec(bytes).map_err(|e| TextError::BadFont { path: origin, reason: e.to_string() })
+    load(&source)
 }
 
 /// Renders `text` with an em size of `size` pixels, in the font called `font` (see
 /// [`find_font`]) or in the built-in Inter. Lines are separated by a newline or by
 /// the two characters `\n` (handy on the command line).
 pub fn render(text: &str, font: Option<&str>, size: u32) -> Result<GrayImage, TextError> {
-    let font = load_font(font)?;
+    Ok(render_with(&load_font(font)?, text, size))
+}
+
+/// Like [`render`], with a font already loaded by [`load`].
+pub fn render_with(font: &FontVec, text: &str, size: u32) -> GrayImage {
     // `PxScale` is the ascent-to-descent height; `size` is the em size, as in FreeType.
     let em = font.units_per_em().unwrap_or(1000.0);
     let scaled = font.as_scaled(PxScale::from(size as f32 * font.height_unscaled() / em));
@@ -117,10 +146,17 @@ pub fn render(text: &str, font: Option<&str>, size: u32) -> Result<GrayImage, Te
         (b.0.min(r.min.x as i32), b.1.min(r.min.y as i32), b.2.max(r.max.x as i32), b.3.max(r.max.y as i32))
     });
     if outlines.is_empty() {
-        return Ok(GrayImage::from_pixel(1, 1, Luma([255])));
+        return GrayImage::from_pixel(1, 1, Luma([255]));
     }
-    let width = (max_x - min_x + 2 * BORDER).max(1) as u32;
-    let height = (max_y - min_y + 2 * BORDER).max(1) as u32;
+    // A malformed font can report absurd glyph bounds: refuse a canvas that would not fit in
+    // memory (or overflow) rather than try to allocate it.
+    let border = 2 * i64::from(BORDER);
+    let width = (i64::from(max_x) - i64::from(min_x) + border).max(1);
+    let height = (i64::from(max_y) - i64::from(min_y) + border).max(1);
+    if width * height > MAX_AREA {
+        return GrayImage::from_pixel(1, 1, Luma([255]));
+    }
+    let (width, height) = (width as u32, height as u32);
     let mut im = GrayImage::from_pixel(width, height, Luma([255]));
     for outline in &outlines {
         let origin = outline.px_bounds().min;
@@ -134,7 +170,19 @@ pub fn render(text: &str, font: Option<&str>, size: u32) -> Result<GrayImage, Te
             }
         });
     }
-    Ok(imaging::bw_otsu(&im))
+    imaging::bw_otsu(&im)
+}
+
+/// Em size at which [`render_with`] draws the ink of `text` about `height` pixels tall (within
+/// a pixel or two), without the white border around it: a first guess, then one proportional
+/// correction. `text` must contain at least one visible glyph.
+pub fn size_for_height(font: &FontVec, text: &str, height: u32) -> u32 {
+    // Measured on the ink after the threshold, as the Size row of the window measures it.
+    let inner = |size: u32| f64::from(imaging::ink_bounds(&render_with(font, text, size)).map_or(1, |(_, _, _, h)| h));
+    let target = f64::from(height.max(1));
+    let guess = 100;
+    let first = (f64::from(guess) * target / inner(guess)).round().clamp(1.0, f64::from(MAX_SIZE)) as u32;
+    (f64::from(first) * target / inner(first)).round().clamp(1.0, f64::from(MAX_SIZE)) as u32
 }
 
 #[cfg(test)]
@@ -170,6 +218,31 @@ mod tests {
         let font = ab_glyph::FontRef::try_from_slice(BUILT_IN_FONT).unwrap();
         for c in "…×–•✓".chars() {
             assert_ne!(font.glyph_id(c).0, 0, "Inter lacks {c:?}");
+        }
+    }
+
+    #[test]
+    fn render_with_matches_render() {
+        let font = load(&FontSource::BuiltIn).unwrap();
+        assert_eq!(render_with(&font, "NEJE", 48), render("NEJE", None, 48).unwrap());
+    }
+
+    #[test]
+    fn font_file_by_path_and_index() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts/Inter-Regular.ttf");
+        let font = load(&FontSource::File { path, index: 0 }).unwrap();
+        assert_eq!(render_with(&font, "Hi", 40), render("Hi", None, 40).unwrap());
+        let missing = FontSource::File { path: PathBuf::from("/no/such/font.ttf"), index: 0 };
+        assert!(matches!(load(&missing), Err(TextError::BadFont { .. })));
+    }
+
+    #[test]
+    fn size_for_height_hits_the_height() {
+        let font = load(&FontSource::BuiltIn).unwrap();
+        for target in [30u32, 80, 200] {
+            let size = size_for_height(&font, "Hello\\nWorld", target);
+            let (_, _, _, got) = imaging::ink_bounds(&render_with(&font, "Hello\\nWorld", size)).unwrap();
+            assert!(got.abs_diff(target) <= 1, "asked {target}, got {got} at size {size}");
         }
     }
 }

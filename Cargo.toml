@@ -39,6 +39,8 @@ regex = "1.13.1"
 # Without libudev: on Linux the ports are listed from /sys/class/tty (no build dependency).
 serialport = { version = "4.10.1", default-features = false }
 thiserror = "2.0.21"
+# Font names for the font picker; the version ab_glyph already uses.
+ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
 
 dirs = { version = "7.0.0", optional = true }
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }
