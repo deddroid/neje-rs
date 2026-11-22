@@ -108,6 +108,10 @@ neje-gui photo.jpg       # open a picture or a G-code file at start-up
 Open a picture (or drop it on the window), choose the conversion, connect, send the image,
 then start. The red trace on the preview follows the positions reported by the engraver.
 
+The Size row scales what is on the work area to a width or height in millimetres. Add text…
+puts the text over the preview: drag it to move it, drag a corner to resize it, pick any
+installed font from the list, then Place it.
+
 ### Terminal
 
 ```sh
@@ -180,8 +184,8 @@ saves the image it receives and reports protocol mistakes such as data sent duri
 - JPEG files: decoders differ by one level on a few pixels, so the result can differ by a
   few dots from the Python prototype and from the original program (which used the Windows
   decoder). Everything after decoding is identical. PNG, BMP and the others are exact.
-- Text is drawn with the built-in Inter font (or the one given with `--font`) and a
-  different font engine than the prototype: not the same pixels.
+- Text is drawn with the built-in Inter font (or the one given with `--font` or picked in
+  the window) and a different font engine than the prototype: not the same pixels.
 - PNG files with a transparent colour key in RGB mode, and 16-bit PNG files, are read
   slightly differently from the prototype.
 - `move` shifts where the image lands by 8 pixels per step, and the machine has no limit
