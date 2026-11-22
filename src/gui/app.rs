@@ -3,20 +3,23 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+use ab_glyph::FontVec;
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke};
 use image::{GrayImage, RgbImage};
 use neje::device::{self, PortInfo};
 use neje::doctor::{self, Problem};
+use neje::fonts::{self, FontEntry};
+use neje::gcode;
 use neje::i18n::{self, Lang, tr};
 use neje::imaging::{self, Mode};
 use neje::messages::{describe, laser_checklist, mode_description, problem_fix_label, problem_text, problem_title};
 use neje::plan::{self, Plan, PrintMode};
 use neje::protocol::{BURN_MAX, BURN_MIN, Command, Direction, Event, MEASURED_MM_PER_PX, Protocol, Version};
 use neje::scale::Baseline;
-use neje::{gcode, text};
+use neje::text::{self, FontSource};
 
 use crate::settings::Settings;
 use crate::theme::{self, palette};
@@ -28,6 +31,10 @@ const LOG_LINES: usize = 200;
 const MODE_STRIP_HEIGHT: f32 = 156.0;
 /// Positions kept for the red trace on the preview.
 const MAX_DOTS: usize = 40_000;
+/// Smallest em size of a text, in pixels.
+const MIN_TEXT: u32 = 6;
+/// Side of the corner handles of the floating text, in points.
+const HANDLE: f32 = 10.0;
 const IMAGE_EXTENSIONS: [&str; 8] = ["jpg", "jpeg", "png", "bmp", "gif", "tif", "tiff", "webp"];
 
 /// What the window was asked to do at start-up.
@@ -121,9 +128,123 @@ enum LaserAction {
     Command(Command),
 }
 
-struct TextDraft {
+/// Text being placed: drawn over the preview, outside `base`, until it is placed.
+struct FloatingText {
     text: String,
+    font: FontSource,
+    /// `font`, loaded.
+    face: FontVec,
+    /// Em size in pixels.
     size: u32,
+    /// Centre on the work area, in pixels.
+    centre: egui::Pos2,
+    stamp: GrayImage,
+    texture: Option<egui::TextureHandle>,
+    /// Set when the stamp must be drawn again.
+    dirty: bool,
+    /// Height asked in the window, in mm; kept while the text or the font change.
+    asked_mm: Option<f64>,
+    /// Em size and pointer distance from the centre when a corner drag started.
+    resize_from: Option<(u32, f32)>,
+    /// Filter of the font list.
+    filter: String,
+}
+
+impl FloatingText {
+    fn new(font: FontSource, face: FontVec, centre: f32) -> Self {
+        FloatingText {
+            text: String::new(),
+            font,
+            face,
+            size: 48,
+            centre: egui::pos2(centre, centre),
+            stamp: GrayImage::from_pixel(1, 1, image::Luma([255])),
+            texture: None,
+            dirty: true,
+            asked_mm: None,
+            resize_from: None,
+            filter: String::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.trim().is_empty()
+    }
+
+    fn set_size(&mut self, size: u32) {
+        let size = size.clamp(MIN_TEXT, text::MAX_SIZE);
+        if size != self.size {
+            self.size = size;
+            self.dirty = true;
+        }
+    }
+
+    /// Applies the height asked in mm, if any, to the current text and font.
+    fn fit_height(&mut self) {
+        if let Some(mm) = self.asked_mm
+            && !self.is_empty()
+        {
+            let px = (mm / MEASURED_MM_PER_PX).round().max(1.0) as u32;
+            self.set_size(text::size_for_height(&self.face, &self.text, px));
+        }
+    }
+
+    /// Draws the stamp again if something changed, and its texture for the preview.
+    fn refresh(&mut self, ctx: &egui::Context) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        self.stamp = text::render_with(&self.face, &self.text, self.size);
+        // The GPU refuses textures larger than `max_texture_side`: a long line at a large height
+        // is shown from a smaller copy, stretched back over the stamp on the preview.
+        let max = ctx.input(|i| i.max_texture_side) as f64;
+        let (w, h) = (f64::from(self.stamp.width()), f64::from(self.stamp.height()));
+        let shrunk = (w > max || h > max).then(|| {
+            let ratio = (max / w).min(max / h);
+            let (sw, sh) = (((w * ratio) as u32).max(1), ((h * ratio) as u32).max(1));
+            image::imageops::resize(&self.stamp, sw, sh, image::imageops::FilterType::Triangle)
+        });
+        let shown = shrunk.as_ref().unwrap_or(&self.stamp);
+        // Ink opaque, paper transparent: the preview tints it with the accent colour.
+        let rgba: Vec<u8> = shown.pixels().flat_map(|p| if p.0[0] < 128 { [255; 4] } else { [0; 4] }).collect();
+        let image = egui::ColorImage::from_rgba_unmultiplied([shown.width() as usize, shown.height() as usize], &rgba);
+        match &mut self.texture {
+            Some(texture) => texture.set(image, egui::TextureOptions::NEAREST),
+            None => self.texture = Some(ctx.load_texture("floating-text", image, egui::TextureOptions::NEAREST)),
+        }
+    }
+
+    /// Centre in whole pixels, as given to `imaging::place`.
+    fn anchor(&self) -> (i64, i64) {
+        (self.centre.x.round() as i64, self.centre.y.round() as i64)
+    }
+
+    /// Top left corner on the work area, where `imaging::place` puts the stamp.
+    fn top_left(&self) -> egui::Vec2 {
+        let (cx, cy) = self.anchor();
+        egui::vec2(
+            (cx - i64::from(self.stamp.width()).div_euclid(2)) as f32,
+            (cy - i64::from(self.stamp.height()).div_euclid(2)) as f32,
+        )
+    }
+}
+
+/// The installed fonts, found by a thread of their own at start-up.
+enum Fonts {
+    Scanning(Receiver<Vec<FontEntry>>),
+    Ready(Vec<FontEntry>),
+}
+
+/// Name of `font` as shown in the text window.
+fn font_label(font: &FontSource, fonts: &[FontEntry]) -> String {
+    match font {
+        FontSource::BuiltIn => tr("Inter (built-in)", "Inter (integrato)").to_owned(),
+        FontSource::File { path, index } => fonts
+            .iter()
+            .find(|f| &f.path == path && f.index == *index)
+            .map_or_else(|| file_name(path), FontEntry::label),
+    }
 }
 
 enum Picked {
@@ -189,9 +310,9 @@ pub struct App {
     baseline: Option<Baseline>,
     /// Size asked in the fields (width, height in mm) while scaling from `baseline`.
     size_mm: Option<(f64, f64)>,
-    /// Text waiting for a click on the preview to be placed.
-    pending_text: Option<GrayImage>,
-    text_dialog: Option<TextDraft>,
+    /// Text being placed over the preview.
+    floating: Option<FloatingText>,
+    fonts: Fonts,
 
     link: Link,
     /// What the system lacks for the engraver (driver, permission), shown as a banner.
@@ -222,6 +343,8 @@ pub struct App {
     picked_tx: Sender<Picked>,
     picked_rx: Receiver<Picked>,
     shots: Option<Screenshots>,
+    /// True when a widget had the keyboard focus at the end of the last frame.
+    had_focus: bool,
 }
 
 struct PlanRequest {
@@ -321,6 +444,13 @@ impl App {
             ]);
             Screenshots { dir, steps, index: 0, frames: 0, requested: false, tx, rx }
         });
+        let (fonts_tx, fonts_rx) = mpsc::channel();
+        let fonts_ctx = cc.egui_ctx.clone();
+        std::thread::spawn(move || {
+            // The window may have closed meanwhile; then the list no longer matters.
+            let _ = fonts_tx.send(fonts::scan());
+            fonts_ctx.request_repaint();
+        });
         let mut app = App {
             worker: Worker::spawn(cc.egui_ctx.clone()),
             burn,
@@ -344,8 +474,8 @@ impl App {
             picture_only: false,
             baseline: None,
             size_mm: None,
-            pending_text: None,
-            text_dialog: None,
+            floating: None,
+            fonts: Fonts::Scanning(fonts_rx),
             link: Link::Disconnected,
             problems: Vec::new(),
             fixing: false,
@@ -366,6 +496,7 @@ impl App {
             picked_tx,
             picked_rx,
             shots,
+            had_focus: false,
         };
         app.refresh_ports();
         if let Some(path) = startup.image {
@@ -518,6 +649,45 @@ impl App {
         } else {
             (mm * bw / bh, mm)
         });
+    }
+
+    fn poll_fonts(&mut self) {
+        if let Fonts::Scanning(rx) = &self.fonts {
+            match rx.try_recv() {
+                Ok(list) => self.fonts = Fonts::Ready(list),
+                // The scan thread died: carry on with the built-in font only.
+                Err(TryRecvError::Disconnected) => self.fonts = Fonts::Ready(Vec::new()),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    /// Starts a floating text in the middle of the work area, in the last font used.
+    fn open_text(&mut self) {
+        let remembered = self.settings.font_source();
+        let (font, face) = match text::load(&remembered) {
+            Ok(face) => (remembered, face),
+            Err(e) => {
+                self.log_error(e);
+                (FontSource::BuiltIn, text::load(&FontSource::BuiltIn).expect("the built-in font loads"))
+            }
+        };
+        self.floating = Some(FloatingText::new(font, face, self.base_size() as f32 / 2.0));
+    }
+
+    /// Burns the floating text into the composition.
+    fn place_text(&mut self) {
+        let Some(float) = self.floating.take() else { return };
+        if float.is_empty() {
+            return;
+        }
+        let stamp =
+            if float.dirty { text::render_with(&float.face, &float.text, float.size) } else { float.stamp.clone() };
+        let (cx, cy) = float.anchor();
+        let base = imaging::place(&self.base, &stamp, cx, cy);
+        self.set_base(base);
+        self.settings.remember_font(&float.font);
+        self.save_settings();
     }
 
     /// Lists the ports again and checks driver and permissions (reads `/sys`, opens nothing).
@@ -842,16 +1012,7 @@ impl App {
             ui.painter().rect_stroke(rect, radius, Stroke::new(1.0, theme::hairline(p)), egui::StrokeKind::Inside);
             self.paint_trace(ui, rect);
             self.preview_click(&response, rect);
-            if self.pending_text.is_some() {
-                let hint = tr("Click where the text goes", "Clicca dove mettere il testo");
-                let pos = rect.center_top() + egui::vec2(0.0, 22.0);
-                let galley =
-                    ui.painter().layout_no_wrap(hint.to_owned(), egui::FontId::proportional(14.0), Color32::WHITE);
-                let bubble = egui::Rect::from_center_size(pos, galley.size() + egui::vec2(20.0, 10.0));
-                ui.painter().rect_filled(bubble, bubble.height() / 2.0, p.accent);
-                ui.painter().galley(bubble.center() - galley.size() / 2.0, galley, Color32::WHITE);
-                response.on_hover_cursor(egui::CursorIcon::Crosshair);
-            }
+            self.floating_overlay(ui, rect);
         });
 
         ui.add_space(4.0);
@@ -1013,17 +1174,71 @@ impl App {
         }
     }
 
+    /// The floating text over the preview: drag it to move it, drag a corner to resize it.
+    fn floating_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let p = palette(ui);
+        let area = self.base_size() as f32;
+        let scale = rect.width() / area;
+        let Some(float) = self.floating.as_mut() else { return };
+        float.refresh(ui.ctx());
+        if float.is_empty() {
+            return;
+        }
+        let size = egui::vec2(float.stamp.width() as f32, float.stamp.height() as f32) * scale;
+        let screen = egui::Rect::from_min_size(rect.min + float.top_left() * scale, size);
+        let painter = ui.painter_at(rect);
+        if let Some(texture) = &float.texture {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(texture.id(), screen, uv, p.accent);
+        }
+        painter.rect_stroke(screen, 0.0, Stroke::new(1.0, p.accent), egui::StrokeKind::Outside);
+
+        // The body first: the handles, added later, sit on top of it. Both are clipped to
+        // the preview so that no hidden drag area covers the widgets around it.
+        let body = ui.interact(screen.intersect(rect), ui.scope_id().with("floating-body"), egui::Sense::drag());
+        let cursor = if body.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab };
+        let body = body.on_hover_cursor(cursor);
+        if body.dragged() {
+            float.centre =
+                (float.centre + body.drag_delta() / scale).clamp(egui::pos2(0.0, 0.0), egui::pos2(area, area));
+        }
+        let centre = screen.center();
+        let corners = [screen.left_top(), screen.right_top(), screen.left_bottom(), screen.right_bottom()];
+        for (i, corner) in corners.into_iter().enumerate() {
+            // Kept inside the preview, so that a text wider than it still has handles to grab.
+            let corner = rect.shrink(HANDLE / 2.0).clamp(corner);
+            let handle = egui::Rect::from_center_size(corner, egui::vec2(HANDLE, HANDLE));
+            painter.rect_filled(handle, 2.0, p.accent);
+            let cursor = if i == 0 || i == 3 { egui::CursorIcon::ResizeNwSe } else { egui::CursorIcon::ResizeNeSw };
+            let response = ui
+                .interact(handle, ui.scope_id().with(("floating-corner", i)), egui::Sense::drag())
+                .on_hover_cursor(cursor);
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let distance = (pointer - centre).length().max(1.0);
+                if response.drag_started() {
+                    float.resize_from = Some((float.size, distance));
+                    float.asked_mm = None;
+                }
+                if response.dragged()
+                    && let Some((from_size, from_distance)) = float.resize_from
+                {
+                    float.set_size((from_size as f32 * distance / from_distance).round() as u32);
+                }
+            }
+            if response.drag_stopped() {
+                float.resize_from = None;
+            }
+        }
+    }
+
     fn preview_click(&mut self, response: &egui::Response, rect: egui::Rect) {
-        if !response.clicked() {
+        if !response.clicked() || self.floating.is_some() {
             return;
         }
         let Some(pos) = response.interact_pointer_pos() else { return };
         let scale = self.base_size() as f32 / rect.width();
         let (x, y) = (((pos.x - rect.left()) * scale) as i64, ((pos.y - rect.top()) * scale) as i64);
-        if let Some(stamp) = self.pending_text.take() {
-            let base = imaging::place(&self.base, &stamp, x, y);
-            self.set_base(base);
-        } else if self.protocol().is_some_and(|p| p.version != Version::V10) {
+        if self.protocol().is_some_and(|p| p.version != Version::V10) {
             // The newer protocols can send the head to a point of the image.
             self.send(Command::MoveTo { x: x.clamp(0, 25_000) as u16, y: y.clamp(0, 25_000) as u16 });
         }
@@ -1205,7 +1420,7 @@ impl App {
                 Some(2) => self.reapply(),
                 Some(_) => {
                     self.original = None;
-                    self.pending_text = None;
+                    self.floating = None;
                     self.reapply();
                 }
                 None => {}
@@ -1236,10 +1451,12 @@ impl App {
             if let Some((mm, width)) = change {
                 self.scale_to(mm, width);
             }
-            let extra =
-                [(tr("Add text…", "Aggiungi testo…"), true, ""), (tr("Save preview…", "Salva anteprima…"), true, "")];
+            let extra = [
+                (tr("Add text…", "Aggiungi testo…"), self.floating.is_none(), ""),
+                (tr("Save preview…", "Salva anteprima…"), true, ""),
+            ];
             match theme::button_row(ui, &extra) {
-                Some(0) => self.text_dialog = Some(TextDraft { text: String::new(), size: 48 }),
+                Some(0) => self.open_text(),
                 Some(_) => self.pick(&ctx, Picked::SavePreview, || {
                     rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name("neje-preview.png").save_file()
                 }),
@@ -1253,8 +1470,10 @@ impl App {
         let connected = protocol.is_some();
         let idle = connected && self.upload.is_none();
         // Nothing is sent while the plan on screen is being recomputed.
-        let ready = idle && self.plans_ready();
+        let floating = self.floating.is_some();
+        let ready = idle && self.plans_ready() && !floating;
         let need = tr("Connect the engraver first", "Prima collega l'incisore");
+        let place_first = tr("Place or cancel the text first", "Prima posiziona o annulla il testo");
         let can = |command: Command| protocol.is_some_and(|p| p.encode(command).is_ok());
         theme::group(ui, tr("Engraving", "Incisione"), |ui| {
             theme::row(ui, tr("Burn time", "Tempo di bruciatura"), |ui| {
@@ -1287,7 +1506,11 @@ impl App {
                     // One button for the whole sequence: upload, engrave, next job.
                     let label = format!("{} {jobs} {}", tr("Engrave in", "Incidi in"), tr("jobs", "lavori"));
                     let button = theme::primary(ui, &label).min_size(egui::vec2(width, theme::CONTROL_HEIGHT));
-                    if ui.add_enabled(ready, button).on_disabled_hover_text(need).clicked() {
+                    if ui
+                        .add_enabled(ready, button)
+                        .on_disabled_hover_text(if floating { place_first } else { need })
+                        .clicked()
+                    {
                         self.confirm = Some(LaserAction::Jobs);
                     }
                     return;
@@ -1301,7 +1524,16 @@ impl App {
                 let button = if self.image_sent { egui::Button::new(label) } else { theme::primary(ui, label) };
                 let response =
                     ui.add_enabled(ready && !empty, button.min_size(egui::vec2(width, theme::CONTROL_HEIGHT)));
-                if response.on_disabled_hover_text(if connected { nothing } else { need }).clicked() {
+                if response
+                    .on_disabled_hover_text(if floating {
+                        place_first
+                    } else if connected {
+                        nothing
+                    } else {
+                        need
+                    })
+                    .clicked()
+                {
                     let image = self.plan().jobs[0].image.clone();
                     self.upload = Some(0.0);
                     self.uploading = Some(image.clone());
@@ -1507,39 +1739,143 @@ impl App {
         }
     }
 
-    fn text_dialog(&mut self, ctx: &egui::Context) {
-        let Some(draft) = self.text_dialog.as_mut() else { return };
+    /// The window of the floating text: what it says, its font and its height.
+    /// `laser_open` tells whether the laser confirmation was open in this frame: Esc and
+    /// Ctrl+Enter then belong to it.
+    fn text_window(&mut self, ctx: &egui::Context, laser_open: bool) {
+        let max_mm = px_to_mm(self.base_size());
+        let Some(float) = self.floating.as_mut() else { return };
+        let (fonts, scanning): (&[FontEntry], bool) = match &self.fonts {
+            Fonts::Ready(list) => (list, false),
+            Fonts::Scanning(_) => (&[], true),
+        };
         let mut decision = None;
-        theme::modal("text", ctx).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.label(RichText::new(tr("Text to engrave", "Testo da incidere")).font(theme::title_font(22.0)));
-            ui.add(egui::TextEdit::multiline(&mut draft.text).desired_rows(3).desired_width(f32::INFINITY));
-            ui.horizontal(|ui| {
-                ui.label(tr("Size (pixels)", "Dimensione (pixel)"));
-                ui.add(egui::DragValue::new(&mut draft.size).range(6..=400));
+        let mut chosen = None;
+        let mut asked = None;
+        egui::Window::new(tr("Text to engrave", "Testo da incidere"))
+            .id(egui::Id::unique("text-window"))
+            .frame(theme::panel_frame(ctx))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(340.0)
+            .default_pos(egui::pos2(48.0, 96.0))
+            .show(ctx, |ui| {
+                let edit = egui::TextEdit::multiline(&mut float.text)
+                    .hint_text(tr("Type the text here", "Scrivi qui il testo"))
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY);
+                if ui.add(edit).changed() {
+                    float.dirty = true;
+                    float.fit_height();
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr("Font", "Carattere"));
+                    ui.label(RichText::new(font_label(&float.font, fonts)).strong());
+                });
+                let search = egui::TextEdit::singleline(&mut float.filter)
+                    .hint_text(tr("Search fonts", "Cerca un carattere"))
+                    .desired_width(f32::INFINITY);
+                ui.add(search);
+                let needle = float.filter.to_lowercase();
+                let built_in = tr("Inter (built-in)", "Inter (integrato)");
+                let show_built_in = built_in.to_lowercase().contains(&needle);
+                let matches: Vec<&FontEntry> =
+                    fonts.iter().filter(|f| f.label().to_lowercase().contains(&needle)).collect();
+                let first = usize::from(show_built_in);
+                let row_height = ui.spacing().interact_size.y;
+                egui::ScrollArea::vertical().max_height(160.0).auto_shrink([false, true]).show_rows(
+                    ui,
+                    row_height,
+                    matches.len() + first,
+                    |ui, rows| {
+                        for row in rows {
+                            let (source, label) = if row < first {
+                                (FontSource::BuiltIn, built_in.to_owned())
+                            } else {
+                                let entry = matches[row - first];
+                                (entry.source(), entry.label())
+                            };
+                            if ui.selectable_label(source == float.font, label).clicked() {
+                                chosen = Some(source);
+                            }
+                        }
+                    },
+                );
+                if scanning {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(theme::dim(tr("Looking for fonts...", "Ricerca dei caratteri...")));
+                    });
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr("Height", "Altezza"));
+                    // The ink, as the Size row measures it, not the white border of the stamp.
+                    let (_, _, iw, ih) =
+                        imaging::ink_bounds(&float.stamp).unwrap_or((0, 0, float.stamp.width(), float.stamp.height()));
+                    let measured = px_to_mm(ih);
+                    let mut mm = float.asked_mm.unwrap_or(measured);
+                    if ui.add_enabled(!float.is_empty(), mm_field(&mut mm, max_mm)).changed() {
+                        asked = Some(mm);
+                    }
+                    if !float.is_empty() {
+                        let w = px_to_mm(iw);
+                        ui.label(theme::dim(format!("{w:.1} × {measured:.1} mm")));
+                    }
+                });
+                ui.label(theme::dim(tr(
+                    "Drag the text on the preview to move it, drag a corner to resize it.",
+                    "Trascina il testo sull'anteprima per spostarlo, trascina un angolo per ridimensionarlo.",
+                )));
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let place = ui
+                        .add_enabled(!float.is_empty(), theme::primary(ui, tr("Place", "Posiziona")))
+                        .on_hover_text(tr("Burn it into the image (Ctrl+Enter)", "Fissalo nell'immagine (Ctrl+Invio)"));
+                    if place.clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button(tr("Cancel", "Annulla")).clicked() {
+                        decision = Some(false);
+                    }
+                });
             });
-            ui.add_space(8.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let ready = !draft.text.trim().is_empty();
-                if ui
-                    .add_enabled(ready, theme::primary(ui, tr("Place on the image", "Posiziona sull'immagine")))
-                    .clicked()
-                {
-                    decision = Some(true);
+        if let Some(mm) = asked {
+            float.asked_mm = Some(mm);
+            float.fit_height();
+        }
+        let mut error = None;
+        if let Some(source) = chosen {
+            match text::load(&source) {
+                Ok(face) => {
+                    float.font = source;
+                    float.face = face;
+                    float.dirty = true;
+                    float.fit_height();
                 }
-                if ui.button(tr("Cancel", "Annulla")).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    decision = Some(false);
-                }
-            });
-        });
-        if let Some(accepted) = decision {
-            let draft = self.text_dialog.take().expect("the dialog is open");
-            if accepted {
-                match text::render(&draft.text, None, draft.size) {
-                    Ok(stamp) => self.pending_text = Some(stamp),
-                    Err(e) => self.log_error(e),
-                }
+                Err(e) => error = Some(e),
             }
+        }
+        let empty = float.is_empty();
+        if let Some(e) = error {
+            self.log_error(e);
+        }
+        let (escape, ctrl_enter) =
+            ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.modifiers.command && i.key_pressed(egui::Key::Enter)));
+        // The first Esc only leaves the field being edited; the next one cancels.
+        let escape = escape && !self.had_focus;
+        if !laser_open {
+            if escape {
+                decision = Some(false);
+            } else if ctrl_enter && !empty {
+                decision = Some(true);
+            }
+        }
+        match decision {
+            Some(true) => self.place_text(),
+            Some(false) => self.floating = None,
+            None => {}
         }
     }
 }
@@ -1549,6 +1885,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_worker();
         self.poll_files(&ctx);
+        self.poll_fonts();
         self.refresh_plans();
         self.screenshot_step(&ctx);
         let p = palette(ui);
@@ -1563,7 +1900,9 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 16, right: 8, top: 12, bottom: 12 }))
             .show(ui, |ui| self.preview(ui));
+        let laser_open = self.confirm.is_some();
         self.laser_dialog(&ctx);
-        self.text_dialog(&ctx);
+        self.text_window(&ctx, laser_open);
+        self.had_focus = ctx.memory(|m| m.focused().is_some());
     }
 }
