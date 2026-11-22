@@ -15,6 +15,7 @@ use neje::imaging::{self, Mode};
 use neje::messages::{describe, laser_checklist, mode_description, problem_fix_label, problem_text, problem_title};
 use neje::plan::{self, Plan, PrintMode};
 use neje::protocol::{BURN_MAX, BURN_MIN, Command, Direction, Event, MEASURED_MM_PER_PX, Protocol, Version};
+use neje::scale::Baseline;
 use neje::{gcode, text};
 
 use crate::settings::Settings;
@@ -180,6 +181,14 @@ pub struct App {
     original: Option<RgbImage>,
     mode: Mode,
     gcode_fit: bool,
+    /// Bounding box of the ink of `base`.
+    ink: Option<(u32, u32, u32, u32)>,
+    /// True while `base` holds only the opened picture, as converted.
+    picture_only: bool,
+    /// The 100 % state the size fields scale from; `None` until the size is first changed.
+    baseline: Option<Baseline>,
+    /// Size asked in the fields (width, height in mm) while scaling from `baseline`.
+    size_mm: Option<(f64, f64)>,
     /// Text waiting for a click on the preview to be placed.
     pending_text: Option<GrayImage>,
     text_dialog: Option<TextDraft>,
@@ -258,6 +267,25 @@ fn file_name(path: &Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
+/// A length in millimetres, up to `max`.
+fn mm_field(value: &mut f64, max: f64) -> egui::DragValue<'_> {
+    // Typed values apply on Enter or focus loss: applying each keystroke would clamp partial input
+    // and re-render the whole area while typing.
+    // Without `clamp_existing_to_range(false)` a value shown out of range is clamped and reported
+    // as changed with no input at all.
+    egui::DragValue::new(value)
+        .speed(0.05)
+        .range(0.1..=max)
+        .fixed_decimals(1)
+        .suffix(" mm")
+        .update_while_editing(false)
+        .clamp_existing_to_range(false)
+}
+
+fn px_to_mm(px: u32) -> f64 {
+    f64::from(px) * MEASURED_MM_PER_PX
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
         theme::apply(&cc.egui_ctx);
@@ -312,6 +340,10 @@ impl App {
             original: None,
             mode: Mode::Bw,
             gcode_fit: true,
+            ink: None,
+            picture_only: false,
+            baseline: None,
+            size_mm: None,
             pending_text: None,
             text_dialog: None,
             link: Link::Disconnected,
@@ -369,7 +401,17 @@ impl App {
         self.base.width()
     }
 
+    /// A new composition: what was on the work area before is the new 100 %.
     fn set_base(&mut self, base: GrayImage) {
+        self.show_base(base);
+        self.baseline = None;
+        self.size_mm = None;
+        self.picture_only = false;
+    }
+
+    /// Shows `base` keeping the starting point of the scaling.
+    fn show_base(&mut self, base: GrayImage) {
+        self.ink = imaging::ink_bounds(&base);
         self.base = base;
         self.plans_dirty = true;
         self.dots.clear();
@@ -446,6 +488,36 @@ impl App {
             base = imaging::center_on(&base, &imaging::prepare(original, size, self.mode));
         }
         self.set_base(base);
+        self.picture_only = self.original.is_some();
+    }
+
+    /// Scales the content so that its width (`width`) or height is `mm`, from the 100 % state.
+    fn scale_to(&mut self, mm: f64, width: bool) {
+        if self.baseline.is_none() {
+            self.baseline = match (&self.original, self.picture_only) {
+                (Some(original), true) => Baseline::picture(original, self.mode, self.base_size()),
+                _ => Baseline::bitmap(&self.base),
+            };
+        }
+        let Some(baseline) = &self.baseline else { return };
+        let (bw, bh) = baseline.ink_size();
+        let along = if width { bw } else { bh };
+        let requested = mm / px_to_mm(along);
+        let factor = baseline.clamp_factor(requested);
+        let (w, h) = baseline.size(factor);
+        let image = baseline.render(w, h);
+        self.show_base(image);
+        // The fields keep what was asked rather than the whole pixels it became: snapping them
+        // would fight the dragging of the values. The edited one stays exactly `mm`, as the field
+        // drops what is being typed when the value it gets back differs from it.
+        let (bw, bh) = (f64::from(bw), f64::from(bh));
+        self.size_mm = Some(if factor != requested {
+            (bw * factor * MEASURED_MM_PER_PX, bh * factor * MEASURED_MM_PER_PX)
+        } else if width {
+            (mm, mm * bh / bw)
+        } else {
+            (mm * bw / bh, mm)
+        });
     }
 
     /// Lists the ports again and checks driver and permissions (reads `/sys`, opens nothing).
@@ -1137,6 +1209,32 @@ impl App {
                     self.reapply();
                 }
                 None => {}
+            }
+            let max_mm = px_to_mm(self.base_size());
+            let shown = self.size_mm.or_else(|| self.ink.map(|(_, _, w, h)| (px_to_mm(w), px_to_mm(h))));
+            let mut change = None;
+            theme::row(ui, tr("Size", "Dimensione"), |ui| {
+                let Some((mut w, mut h)) = shown else {
+                    ui.label(theme::dim(tr("nothing to burn", "niente da bruciare")));
+                    return;
+                };
+                // Right to left: height first.
+                let height = ui
+                    .add(mm_field(&mut h, max_mm))
+                    .on_hover_text(tr("Height of what will be burnt", "Altezza di ciò che verrà bruciato"));
+                if height.changed() {
+                    change = Some((h, false));
+                }
+                ui.label("×");
+                let width = ui
+                    .add(mm_field(&mut w, max_mm))
+                    .on_hover_text(tr("Width of what will be burnt", "Larghezza di ciò che verrà bruciato"));
+                if width.changed() {
+                    change = Some((w, true));
+                }
+            });
+            if let Some((mm, width)) = change {
+                self.scale_to(mm, width);
             }
             let extra =
                 [(tr("Add text…", "Aggiungi testo…"), true, ""), (tr("Save preview…", "Salva anteprima…"), true, "")];
