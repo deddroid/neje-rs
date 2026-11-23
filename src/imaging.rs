@@ -216,7 +216,11 @@ pub fn dither(img: &GrayImage) -> GrayImage {
 
 /// `pictureBox_show_DragDrop`: shrink to `base_size`, grey, then black and white.
 pub fn prepare(img: &RgbImage, base_size: u32, mode: Mode) -> GrayImage {
-    let gray = to_gray(&to_equal_small(img, base_size));
+    convert(to_gray(&to_equal_small(img, base_size)), mode)
+}
+
+/// Grey to black and white with `mode`.
+pub fn convert(gray: GrayImage, mode: Mode) -> GrayImage {
     match mode {
         Mode::Bw => bw_otsu(&gray),
         Mode::Dither => dither(&gray),
@@ -228,6 +232,15 @@ pub fn prepare(img: &RgbImage, base_size: u32, mode: Mode) -> GrayImage {
             out
         }
     }
+}
+
+/// `img` resized to exactly `w`×`h` (larger or smaller, bilinear) and converted with `mode`.
+pub fn prepare_sized(img: &RgbImage, w: u32, h: u32, mode: Mode) -> GrayImage {
+    let (w, h) = (w.max(1), h.max(1));
+    let data =
+        resample::resize_bilinear(img.as_raw(), img.width() as usize, img.height() as usize, 3, w as usize, h as usize);
+    let rgb = RgbImage::from_raw(w, h, data).expect("resize returns w*h*3 bytes");
+    convert(to_gray(&rgb), mode)
 }
 
 /// Empty (white) work area.
@@ -283,6 +296,49 @@ pub fn place(base: &GrayImage, img: &GrayImage, cx: i64, cy: i64) -> GrayImage {
     out
 }
 
+/// Bounding box (x, y, width, height) of the pixels that are not pure white.
+pub fn ink_bounds(img: &GrayImage) -> Option<(u32, u32, u32, u32)> {
+    let mut found: Option<(u32, u32, u32, u32)> = None;
+    for (x, y, p) in img.enumerate_pixels() {
+        if p.0[0] != 255 {
+            found = Some(match found {
+                None => (x, y, x, y),
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+            });
+        }
+    }
+    found.map(|(x0, y0, x1, y1)| (x0, y0, x1 - x0 + 1, y1 - y0 + 1))
+}
+
+/// The part of `img` inside `bounds` (x, y, width, height).
+pub fn crop(img: &GrayImage, (x, y, w, h): (u32, u32, u32, u32)) -> GrayImage {
+    image::imageops::crop_imm(img, x, y, w, h).to_image()
+}
+
+/// `img` resized to `w`×`h` (bilinear) and made black and white again at a fixed threshold.
+pub fn scale_bitmap(img: &GrayImage, w: u32, h: u32) -> GrayImage {
+    let (w, h) = (w.max(1), h.max(1));
+    let data =
+        resample::resize_bilinear(img.as_raw(), img.width() as usize, img.height() as usize, 1, w as usize, h as usize);
+    let mut out = GrayImage::from_raw(w, h, data).expect("resize returns w*h bytes");
+    for p in out.pixels_mut() {
+        p.0[0] = if p.0[0] < 128 { 0 } else { 255 };
+    }
+    out
+}
+
+/// An empty `size`² work area with `img` centred on (`cx`, `cy`), shifted back inside the
+/// area where it would cross an edge.
+pub fn place_inside(size: u32, img: &GrayImage, cx: f64, cy: f64) -> GrayImage {
+    let start = |centre: f64, len: u32| {
+        let first = (centre - f64::from(len) / 2.0).round() as i64;
+        first.clamp(0, (i64::from(size) - i64::from(len)).max(0))
+    };
+    let mut out = new_base(size);
+    paste(&mut out, img, start(cx, img.width()), start(cy, img.height()));
+    out
+}
+
 /// Fraction of pixels that will be burnt (anything that is not pure white).
 pub fn black_ratio(img: &GrayImage) -> f64 {
     let total = img.pixels().len().max(1);
@@ -335,5 +391,57 @@ mod tests {
         let out = place(&base, &stamp, 5, 5);
         assert_eq!(out.get_pixel(5, 5).0[0], 0);
         assert_eq!(out.get_pixel(4, 5).0[0], 255);
+    }
+
+    fn canvas(w: u32, h: u32, black: &[(u32, u32, u32, u32)]) -> GrayImage {
+        let mut im = GrayImage::from_pixel(w, h, Luma([255]));
+        for &(x, y, bw, bh) in black {
+            for yy in y..y + bh {
+                for xx in x..x + bw {
+                    im.put_pixel(xx, yy, Luma([0]));
+                }
+            }
+        }
+        im
+    }
+
+    #[test]
+    fn ink_bounds_finds_the_box() {
+        assert_eq!(ink_bounds(&canvas(50, 40, &[])), None);
+        assert_eq!(ink_bounds(&canvas(50, 40, &[(7, 9, 1, 1)])), Some((7, 9, 1, 1)));
+        assert_eq!(ink_bounds(&canvas(50, 40, &[(3, 30, 2, 2), (40, 5, 4, 1)])), Some((3, 5, 41, 27)));
+    }
+
+    #[test]
+    fn prepare_sized_resizes_both_ways() {
+        let rgb = RgbImage::from_pixel(100, 50, image::Rgb([0, 0, 0]));
+        let up = prepare_sized(&rgb, 300, 150, Mode::Bw);
+        assert_eq!(up.dimensions(), (300, 150));
+        assert!(up.pixels().all(|p| p.0[0] == 0));
+        assert_eq!(prepare_sized(&rgb, 10, 5, Mode::Dither).dimensions(), (10, 5));
+    }
+
+    #[test]
+    fn scale_bitmap_doubles_a_block_and_stays_black_and_white() {
+        let big = scale_bitmap(&canvas(30, 20, &[(5, 5, 20, 10)]), 60, 40);
+        assert_eq!(ink_bounds(&big), Some((10, 10, 40, 20)));
+        assert!(big.pixels().all(|p| p.0[0] == 0 || p.0[0] == 255));
+    }
+
+    #[test]
+    fn crop_cuts_the_box() {
+        let im = canvas(50, 40, &[(10, 12, 5, 3)]);
+        let cut = crop(&im, (10, 12, 5, 3));
+        assert_eq!(cut.dimensions(), (5, 3));
+        assert!(cut.pixels().all(|p| p.0[0] == 0));
+    }
+
+    #[test]
+    fn place_inside_centres_and_keeps_inside() {
+        let block = canvas(20, 10, &[(0, 0, 20, 10)]);
+        assert_eq!(ink_bounds(&place_inside(100, &block, 50.0, 50.0)), Some((40, 45, 20, 10)));
+        assert_eq!(ink_bounds(&place_inside(100, &block, 2.0, 99.0)), Some((0, 90, 20, 10)));
+        let wide = canvas(150, 10, &[(0, 0, 150, 10)]);
+        assert_eq!(ink_bounds(&place_inside(100, &wide, 50.0, 50.0)), Some((0, 45, 100, 10)));
     }
 }

@@ -109,6 +109,10 @@ Apri un'immagine (o trascinala sulla finestra), scegli la conversione, connetti,
 l'immagine e poi avvia. La traccia rossa sull'anteprima segue le posizioni comunicate
 dall'incisore. La lingua si cambia in fondo al pannello, nel gruppo "Applicazione".
 
+La riga Dimensione porta ciò che sta sull'area di lavoro a una larghezza o altezza in
+millimetri. Aggiungi testo… mette il testo sopra l'anteprima: trascinalo per spostarlo,
+trascina un angolo per ridimensionarlo, scegli uno dei caratteri installati, poi Posizionalo.
+
 ### Terminale
 
 ```sh
@@ -183,8 +187,9 @@ durante la cancellazione.
   può differire di qualche punto dal prototipo Python e dal programma originale (che usava
   il decodificatore di Windows). Tutto ciò che viene dopo la decodifica è identico. PNG, BMP
   e gli altri formati sono esatti.
-- Il testo è disegnato con il font Inter incorporato (o con quello indicato da `--font`) e
-  con un motore di font diverso da quello del prototipo: non gli stessi pixel.
+- Il testo è disegnato con il font Inter incorporato (o con quello indicato da `--font` o
+  scelto nella finestra) e con un motore di font diverso da quello del prototipo: non gli
+  stessi pixel.
 - I PNG con un colore trasparente in modalità RGB e i PNG a 16 bit sono letti in modo
   leggermente diverso dal prototipo.
 - `move` sposta di 8 pixel a passo il punto in cui finirà l'immagine, e la macchina non ha

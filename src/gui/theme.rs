@@ -344,15 +344,19 @@ pub fn toggle(ui: &mut egui::Ui, on: &mut bool) -> Response {
     response
 }
 
-/// A dialog over the dimmed window: surface colour, window radius and room around the text.
-pub fn modal(name: &'static str, ctx: &egui::Context) -> egui::Modal {
+/// Frame of dialogs and floating panels.
+pub fn panel_frame(ctx: &egui::Context) -> egui::Frame {
     let p = if ctx.theme() == egui::Theme::Dark { &DARK } else { &LIGHT };
-    let frame = egui::Frame::new()
+    egui::Frame::new()
         .fill(p.surface)
         .stroke(Stroke::new(1.0, hairline(p)))
         .corner_radius(CornerRadius::same(20))
-        .inner_margin(egui::Margin::same(20));
-    egui::Modal::new(egui::Id::unique(name)).frame(frame)
+        .inner_margin(egui::Margin::same(20))
+}
+
+/// A dialog over the dimmed window: surface colour, window radius and room around the text.
+pub fn modal(name: &'static str, ctx: &egui::Context) -> egui::Modal {
+    egui::Modal::new(egui::Id::unique(name)).frame(panel_frame(ctx))
 }
 
 /// Round button with a "refresh" arrow drawn by hand: no font has to provide the symbol.
